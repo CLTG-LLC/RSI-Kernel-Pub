@@ -148,14 +148,17 @@ class DockerSolver:
     """Existing Solver callable; returned score is consumed by GDPevoAdapter.
 
     ``tasks`` registers the caller-authorized dev train tasks, never adjudication
-    or test tasks. ``timeout`` is caller-frozen, used for CLI operations, the
+    or test tasks. Only ``stage="acceptance"``, the separate process after the
+    campaign is closed (prereg "Retention and acceptance"), may also register
+    adjudication train and holdout test tasks. ``timeout`` is caller-frozen, used for CLI operations, the
     health-state wait and attached solve; Docker healthcheck settings stay default.
     Evidence lives outside both the source repository and the transient stage.
     """
 
     upstream_commit = UPSTREAM_COMMIT
 
-    def __init__(self, *, root: Path, tasks: Sequence[FrozenTask], evidence_dir: Path, timeout: float):
+    def __init__(self, *, root: Path, tasks: Sequence[FrozenTask], evidence_dir: Path, timeout: float,
+                 stage: str = "optimise"):
         if isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be a positive frozen config value")
         root, evidence_dir = Path(root), Path(evidence_dir)
@@ -165,7 +168,9 @@ class DockerSolver:
             raise ValueError("evidence must be separate from upstream source")
         if any(p.is_symlink() for p in (evidence_dir, *evidence_dir.parents)):
             raise ValueError("symlink in evidence path")
-        if not tasks or any(t.subset != "train" for t in tasks):
+        if stage not in ("optimise", "acceptance"):
+            raise ValueError("unknown solver stage")
+        if not tasks or (stage == "optimise" and any(t.subset != "train" for t in tasks)):
             raise ValueError("register only authorized dev train tasks")
         self.tasks = {task.item_id: task for task in tasks}
         if len(self.tasks) != len(tasks):
@@ -307,7 +312,7 @@ class DockerSolver:
         if _manifest(input_dir) != _manifest(directory / "input"):
             raise _Stop("staging_manifest_mismatch")
         group_rel = f"data/task_groups/{task.group}"
-        task_rel = f"{group_rel}/train_tasks/{task.task_id}"
+        task_rel = f"{group_rel}/{task.subset}_tasks/{task.task_id}"
         selected = [f"{group_rel}/env", f"{group_rel}/task_group.yaml", f"{task_rel}/input", f"{task_rel}/eval", PROMPT_PATH]
         archived = self._run(["git", "-C", str(self.root), "archive", self.upstream_commit, *selected]).stdout
         trusted = out / "trusted"
@@ -420,13 +425,7 @@ class DockerSolver:
         # Coordinator addition: Docker-native egress boundary; no host firewall.
         # https://docs.docker.com/reference/cli/docker/network/create/#internal
         self._run(["docker", "network", "create", "--internal", network], out / "network-id.txt")
-        self._run(["docker", "network", "create", scope + "-egress"], out / "egress-network-id.txt")
-        conf = out / "build/model-fwd.conf"
-        conf.write_text(FORWARDER_CONF)
-        self._run(["docker", "run", "-d", "--name", scope + "-fwd", "--network", scope + "-egress",
-                   "--add-host", "host.docker.internal:host-gateway",
-                   *_bind(conf, "/etc/nginx/nginx.conf"), NGINX_IMAGE], out / "fwd-id.txt")
-        self._run(["docker", "network", "connect", "--alias", "model-fwd", network, scope + "-fwd"], out / "fwd-connect.txt")
+        self._forwarder(out, scope, network)
         self._run(["docker", "run", "-d", "--name", scope + "-env", "--network", network,
                    "--network-alias", "task-env", "-e", "TASK_ENV_BIND=0.0.0.0", "-e", "TASK_ENV_PORT=9001",
                    "-e", "TASK_ENV_ENABLE_JUDGE=0", "--health-cmd",
@@ -448,6 +447,17 @@ class DockerSolver:
                    solver_image, "python3", "-c", ENVIRONMENT_CHECK], out / "environment-check.json")
         if json.loads((out / "environment-check.json").read_text()) != {"health_status": "ok", "judge_http_status": 404}:
             raise _Stop("environment_check")
+
+    def _forwarder(self, out, scope, network):
+        """The internal network's only egress; also reused by the pilot proposer."""
+        self._run(["docker", "network", "create", scope + "-egress"], out / "egress-network-id.txt")
+        conf = out / "build/model-fwd.conf"
+        conf.parent.mkdir(mode=0o700, exist_ok=True)
+        conf.write_text(FORWARDER_CONF)
+        self._run(["docker", "run", "-d", "--name", scope + "-fwd", "--network", scope + "-egress",
+                   "--add-host", "host.docker.internal:host-gateway",
+                   *_bind(conf, "/etc/nginx/nginx.conf"), NGINX_IMAGE], out / "fwd-id.txt")
+        self._run(["docker", "network", "connect", "--alias", "model-fwd", network, scope + "-fwd"], out / "fwd-connect.txt")
 
     def _solve(self, out, scope, image):
         work = out / "work"

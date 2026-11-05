@@ -23,5 +23,16 @@ def judge_off(env: Mapping[str, str] | None = None) -> Mapping[str, str]:
 
 @dataclass(frozen=True)
 class GDPevoProposerRuntime(ProposerRuntime):
+    # Default stays the kernel's --network none. The live pilot passes one
+    # per-call --internal network whose only egress is the model forwarder.
+    network: str = "none"
+    # A named container replaces --rm so a CLI timeout can kill and verify it
+    # (DockerSolver._stop_timed_out); the caller then removes it on success.
+    name: str | None = None
+
     def docker_argv(self, command: Sequence[str], env: Mapping[str, str] | None = None) -> list[str]:
-        return super().docker_argv(command, judge_off(env))
+        argv = super().docker_argv(command, judge_off(env))
+        if argv[:5] != ["docker", "run", "--rm", "--network", "none"]:
+            raise ValueError("unexpected kernel runtime argv")
+        keep = ["--rm"] if self.name is None else ["--name", self.name]
+        return ["docker", "run", *keep, "--network", self.network, *argv[5:]]
