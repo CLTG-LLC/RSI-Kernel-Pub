@@ -23,7 +23,7 @@ This repo follows [GitHub Flow](https://docs.github.com/en/get-started/using-git
 - Open a pull request into `main` using the template.
 - Write `Closes #<issue>` in the description so that merging closes the issue ([linking a PR to an issue](https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue)).
 - Before merge:
-  - CI is green on the exact PR head SHA;
+  - CI is green on the exact PR head SHA. While Actions are disabled on this repo, run the workflow's commands on a clean checkout of that SHA: `CI=true uv sync --locked && CI=true uv run pytest -q` (JDK 21 on `PATH`), and record the result in the PR;
   - one independent review by a reviewer on a different model from the writer;
   - one fix round, then a re-check.
   - The reviewed diff is frozen by its SHA. If the head moves, the review is void.

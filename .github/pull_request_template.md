@@ -13,5 +13,5 @@ Closes #
 - [ ] Docs / contracts updated where behavior changed
 - [ ] Tests added (failing before, passing after)
 - [ ] Only changes related to the linked issue
-- [ ] CI green on the exact head SHA
+- [ ] CI green on the exact head SHA (Actions off: workflow commands run locally with `CI=true` on that SHA; result recorded here)
 - [ ] Independent review (different model from the writer) recorded; one fix round + re-check done
