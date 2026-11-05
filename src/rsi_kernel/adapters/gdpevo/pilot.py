@@ -1,12 +1,15 @@
 """Pilot driver for the frozen pre-registration (docs/prereg-gdpevo-pilot.md, issue #27).
 
-``optimise`` runs one group campaign per process; ``final`` runs the frozen
-comparison in a separate process once every campaign is closed, then feeds the
-schedule-ordered records to ``loop.accept``. Kernel modules are reused unchanged.
+``optimise`` runs one group campaign per process; ``final`` runs that group's
+comparison in a separate process once its campaign is closed, then feeds the
+schedule-ordered records to ``loop.accept``. The final phase is trimmed to the
+upstream-style comparison (docs/prereg-s4-addendum.md, issue #36); ``rebind``
+records a pre-measurement identity change. Kernel modules are reused unchanged.
 Hosts, keys and the champion skills come from a run-time JSON config, never code.
 
     python -m rsi_kernel.adapters.gdpevo.pilot optimise --config C --group G
-    python -m rsi_kernel.adapters.gdpevo.pilot final --config C
+    python -m rsi_kernel.adapters.gdpevo.pilot final --config C --group G
+    python -m rsi_kernel.adapters.gdpevo.pilot rebind --config C --group G --addendum PATH
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ import hashlib
 import json
 import secrets
 import shutil
+import statistics
 import subprocess
 import sys
 import time
@@ -30,7 +34,7 @@ from ...compare import _valid_score
 from ...decision.backends import DeterministicBackend, JevBackend
 from ...decision.envelope import EnvelopeBuilder
 from ...decision.log import Decider
-from ...loop import ApprovalRecord, accept, run_campaign
+from ...loop import AcceptResult, ApprovalRecord, accept, run_campaign
 from ...splits import load_splits
 from .adapter import GDPevoAdapter, _verify_task, validate_skill
 from .proposer import propose
@@ -49,8 +53,9 @@ MAX_ATTEMPTS = 3
 EVAL_CAP = 36
 SPEND_CAP = 42
 TIMEOUT = 3600  # solver wall time and evaluator timeout, both 3600 s
-# Prereg "Schedule" arm order and "Uncertainty and unchanged control".
-ARMS = ("champion", "candidate", "control")
+# Prereg "Schedule" arm order; the control and the dev re-run are dropped by the S4
+# addendum (#36): upstream compares conditions with acc@3 on test only.
+ARMS = ("champion", "candidate")
 # Prereg "Calibration (reproduced)": feasibility attempt 8, the first dev task.
 CALIBRATION_TASK = (GROUPS[0], "train", DEV_IDS[0])
 CALIBRATION_ANSWER_SHA256 = "5eb5cc630e4f69d1892b2fe721a593b8eb83513c96b723ff4c0f756e518ae96b"
@@ -310,7 +315,8 @@ def _scheduled_valid(rows, item_ids) -> bool:
     """Complete schedule: exactly every (arm, item, run) once, valid score, no failure.
 
     Prereg "Retention": operational or data failures block acceptance, so any invalid
-    dev or control row fails the gate. A valid control score never vetoes by itself.
+    row fails the gate. The S4 addendum (#36) schedules adjudication and holdout only,
+    with the champion and candidate arms.
     """
     expected = {(arm, item, run) for arm in ARMS for item in item_ids for run in range(RUNS)}
     keys = [(r.get("arm"), r.get("item_id"), r.get("run")) for r in rows]
@@ -318,41 +324,111 @@ def _scheduled_valid(rows, item_ids) -> bool:
             and all(_valid_score(r.get("score")) and "failure" not in r for r in rows))
 
 
-def final_phase(*, root: Path, run_dir: Path, champions: Mapping, solver, calibration_answer: Path,
-                calibration_replay, wait: Callable[[Path], None] = _wait_for_owner) -> dict:
+def _identity_ok(frozen, current, champion_id, record) -> bool:
+    """S4 addendum (#36): the frozen identity holds, or one reviewed rebind does.
+
+    A rebind is accepted only if ``from`` is exactly the campaign's frozen identity,
+    ``to`` is exactly the current one, the champion is unchanged and the recorded
+    addendum sha256 matches the addendum file itself.
+    """
+    if record is None:  # no rebind: the frozen identity must hold exactly
+        return current == frozen
+    if not isinstance(record, dict):
+        return False
+    # An existing rebind is always validated in full, and the champion must equal the
+    # frozen, current and recorded one: only code/evaluator hashes may move.
+    addendum = record.get("addendum")
+    return (record.get("from") == frozen and record.get("to") == current
+            and record.get("champion_id") == champion_id == frozen.get("champion_id")
+            == current.get("champion_id")
+            and isinstance(addendum, str) and Path(addendum).is_file()
+            and record.get("addendum_sha256") == _sha(Path(addendum)))
+
+
+def _rebind_record(run_dir: Path, group: str) -> dict | None:
+    path = run_dir / group / "rebind.json"
+    if not path.exists():
+        return None
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        raise PilotStop(f"malformed rebind record in {group}")
+    if not isinstance(record, dict):  # a present file is never treated as absent
+        raise PilotStop(f"malformed rebind record in {group}")
+    return record
+
+
+def rebind(*, root: Path, run_dir: Path, group: str, champion: Mapping, addendum: Path) -> dict:
+    """Record a pre-measurement change of code/evaluator identity (S4 addendum, #36).
+
+    ``from`` is the campaign's frozen identity, so it must equal campaign.json;
+    ``to`` is the identity of the code and inputs that will actually run the final.
+    """
+    root, run_dir, addendum = Path(root), Path(run_dir), Path(addendum)
+    if group not in GROUPS or not run_dir.is_absolute():
+        raise PilotStop("unknown group or relative run directory")
+    group_dir = run_dir / group
+    state = json.loads((group_dir / "campaign.json").read_text())
+    if state.get("status") != "closed":
+        raise PilotStop(f"campaign {group} is open or missing")
+    frozen = {k: state.get(k) for k in ("champion_id", "evaluator_hash", "code_hash")}
+    current = _identity(_champion(champion), frozen_tasks(root, group))
+    if (group_dir / "rebind.json").exists():
+        raise PilotStop(f"rebind already recorded for {group}")
+    if current["champion_id"] != frozen["champion_id"]:
+        raise PilotStop(f"champion changed in {group}")
+    record = {"from": frozen, "to": current, "champion_id": current["champion_id"],
+              "addendum": str(addendum), "addendum_sha256": _sha(addendum),
+              "reason": "docs/prereg-s4-addendum.md"}
+    _json(group_dir / "rebind.json", record)
+    return record
+
+
+def final_phase(*, root: Path, run_dir: Path, group: str, champions: Mapping, solver,
+                calibration_answer: Path, calibration_replay,
+                wait: Callable[[Path], None] = _wait_for_owner) -> AcceptResult:
+    """One group's frozen comparison (S4 addendum, #36): adjudication and holdout only."""
     root, run_dir = Path(root), Path(run_dir)
-    for group in GROUPS:
-        state = run_dir / group / "campaign.json"
-        if not state.exists() or json.loads(state.read_text()).get("status") != "closed":
-            raise PilotStop(f"campaign {group} is open or missing")
-    final_dir = run_dir / "final"
+    if group not in GROUPS or not run_dir.is_absolute():
+        raise PilotStop("unknown group or relative run directory")
+    group_dir = run_dir / group
+    state_path = group_dir / "campaign.json"
+    if not state_path.exists() or json.loads(state_path.read_text()).get("status") != "closed":
+        raise PilotStop(f"campaign {group} is open or missing")
+    final_dir = run_dir / "final" / group
     if (final_dir / "observations.jsonl").exists():
-        raise PilotStop("final phase already ran")  # holdout is reported once
-    # Prereg "Frozen inputs": drift is a STOP before any solver invocation.
-    for group in GROUPS:
-        state = json.loads((run_dir / group / "campaign.json").read_text())
-        frozen = {k: state.get(k) for k in ("champion_id", "evaluator_hash", "code_hash")}
-        if _identity(_champion(champions[group]), frozen_tasks(root, group)) != frozen:
-            raise PilotStop(f"frozen identity drift in {group}")
-    tasks = _prerun(root, run_dir, GROUPS, calibration_answer, calibration_replay)
-    final_dir.mkdir(exist_ok=True)
+        raise PilotStop(f"final phase already ran for {group}")  # holdout is reported once
+    # Prereg "Frozen inputs": drift is a STOP before any solver invocation; a recorded
+    # rebind (S4 addendum) is the only way a pre-measurement change may proceed.
+    state = json.loads(state_path.read_text())
+    frozen = {k: state.get(k) for k in ("champion_id", "evaluator_hash", "code_hash")}
+    champion = _champion(champions[group])
+    tasks = frozen_tasks(root, group)
+    if not _identity_ok(frozen, _identity(champion, tasks), champion.id, _rebind_record(run_dir, group)):
+        raise PilotStop(f"frozen identity drift in {group}")
+    tasks = _prerun(root, run_dir, [group], calibration_answer, calibration_replay)[group]
+    final_dir.mkdir(parents=True, exist_ok=True)
     entropy = run_dir / "entropy.json"
-    if not entropy.exists():  # prereg "Estimator": SeedSequence entropy recorded before execution
-        import numpy as np
-        _json(entropy, {"entropy": np.random.SeedSequence().entropy})
-    setup, records = {}, {}
+    try:  # prereg "Estimator": entropy recorded once, before any execution
+        with entropy.open("x", encoding="utf-8") as stream:
+            import numpy as np
+            stream.write(json.dumps({"entropy": np.random.SeedSequence().entropy}) + "\n")
+    except FileExistsError:
+        pass
+    adapter = _adapter(root, group_dir, tasks, champion, solver, "final-stages")
+    candidate = _selected(group_dir)
+    # Addendum "Items": adjudication and holdout only; dev is never re-run.
+    adj = sorted(adapter.splits.item_ids("adjudication"))
+    hold = sorted(adapter.splits.item_ids("holdout"))
+    scheduled = sorted([*adj, *hold])  # task id order, as in the prereg schedule
+    records = []
     with (final_dir / "observations.jsonl").open("a", encoding="utf-8") as observations:
-        for group in GROUPS:  # prereg "Schedule": group -> attempt -> task id -> arm
-            champion, candidate = _champion(champions[group]), _selected(run_dir / group)
-            adapter = _adapter(root, run_dir / group, tasks[group], champion, solver, "final-stages")
-            setup[group], records[group] = (adapter, champion, candidate), []
-            if candidate is None:
-                continue  # no frozen candidate: accept() returns no_improvement
-            arms = {"champion": champion, "candidate": candidate, "control": champion}
+        if candidate is not None:  # no frozen candidate: no solves, accept() returns no_improvement
+            arms = {"champion": champion, "candidate": candidate}
             # adapter.evaluate admits dev only; reuse its per-item staging/verification.
             adapter.work_dir.mkdir(parents=True, exist_ok=True)
-            for run in range(RUNS):
-                for item in sorted(adapter.tasks):
+            for run in range(RUNS):  # addendum schedule: run -> task id -> arm
+                for item in scheduled:
                     directory = _verify_task(root, adapter.tasks[item])
                     for arm in ARMS:
                         # evaluate()'s dev-only guard protects the optimisation loop; the
@@ -362,46 +438,86 @@ def final_phase(*, root: Path, run_dir: Path, champions: Mapping, solver, calibr
                         row["token_usage"] = _token_usage(row)
                         observations.write(json.dumps(row, sort_keys=True) + "\n")
                         observations.flush()
-                        records[group].append(row)
-    results = {}
-    for group in GROUPS:
-        adapter, champion, candidate = setup[group]
-        adj = sorted(adapter.splits.item_ids("adjudication"))
-        hold = sorted(adapter.splits.item_ids("holdout"))
-        valid = _scheduled_valid(records[group], sorted(adapter.tasks))
-        replay = _Replay([r for r in records[group] if r["arm"] != "control" and r["item_id"] in {*adj, *hold}],
-                         champion.id, candidate.id if candidate else None)
-        results[group] = accept(
-            campaign_id=group, candidate=candidate, champion=champion, adjudicate=replay.evaluate,
-            adjudication_item_ids=adj, evaluator_hash=_evaluator_hash(tasks[group]),
-            retain=lambda comparison, valid=valid: valid and _zero_margin(comparison),
-            approval=_file_approval(run_dir / group, wait), adapter=adapter, archive=adapter.archive,
-            runs=RUNS, holdout=replay.evaluate, holdout_item_ids=hold)
-        if candidate is not None:
-            replay.check_consumed()
-        _json(run_dir / group / "acceptance.json", {"outcome": results[group].outcome})
-    return results
+                        records.append(row)
+    valid = _scheduled_valid(records, scheduled)
+    replay = _Replay(records, champion.id, candidate.id if candidate else None)
+    result = accept(
+        campaign_id=group, candidate=candidate, champion=champion, adjudicate=replay.evaluate,
+        adjudication_item_ids=adj, evaluator_hash=_evaluator_hash(tasks),
+        retain=lambda comparison: valid and _zero_margin(comparison),
+        approval=_file_approval(group_dir, wait), adapter=adapter, archive=adapter.archive,
+        runs=RUNS, holdout=replay.evaluate, holdout_item_ids=hold)
+    if candidate is not None:
+        replay.check_consumed()
+    _json(group_dir / "acceptance.json", {"outcome": result.outcome})
+    return result
+
+
+def _dev_rows(group_dir: Path) -> list[dict]:
+    """Champion dev rows and the selected candidate's dev rows, from the optimise archive.
+
+    The final phase no longer re-runs dev (S4 addendum, #36): these are the same
+    campaign results, and the campaign already wrote them to the public store.
+    """
+    state = json.loads((group_dir / "campaign.json").read_text())
+    selected = None if state["selected"] is None else state["selected"]["id"]
+    results = [json.loads(line) for line in (group_dir / "public/results.jsonl").read_text().splitlines()]
+    rows = []
+    for row in results:
+        arm = {state["champion_id"]: "champion", selected: "candidate"}.get(row["candidate_id"])
+        if arm is not None:
+            rows.append({**row, "arm": arm, "group": row["item_id"].split("/")[0]})
+    return rows
+
+
+def _run_spread(rows) -> float | None:
+    """Champion run-to-run spread: mean population std over runs per task (upstream std@3)."""
+    by_item: dict[str, list[float]] = {}
+    for row in rows:
+        by_item.setdefault(row["item_id"], []).append(float(row["score"]))
+    spreads = [statistics.pstdev(scores) for scores in by_item.values() if len(scores) > 1]
+    return sum(spreads) / len(spreads) if spreads else None
 
 
 def report(run_dir: Path, root: Path, outcome: str) -> list[dict]:
-    """Report inputs: analysis.report_table per split, plus champion-vs-control noise."""
+    """Report inputs (S4 addendum, #36): dev from the optimise archive, then adjudication
+    and holdout; noise is the champion's run-to-run spread on dev, not a control arm."""
     from ...analysis import report_table
-    run_dir = Path(run_dir)
-    rows = [json.loads(line) for line in (run_dir / "final/observations.jsonl").read_text().splitlines()]
-    by_purpose = {"dev": {}, "adjudication": {}, "holdout": {}}
+    run_dir, root = Path(run_dir), Path(root)
+    dev = [row for group in GROUPS for row in _dev_rows(run_dir / group)]
+    # Paired tables cover only groups with a selected candidate; a no-candidate group
+    # has no pairs and is reported as such, never as fabricated candidate rows.
+    paired = [g for g in GROUPS if json.loads((run_dir / g / "campaign.json").read_text())["selected"]]
+    unpaired = [g for g in GROUPS if g not in paired]
+    noise = _run_spread([r for r in dev if r["arm"] == "champion"])
+    if len(paired) < 2:
+        # The paired group bootstrap needs at least two groups (SciPy rejects samples
+        # of fewer than two); say so instead of substituting another estimator.
+        return [{"split": split, "outcome": outcome, "comparison": "unavailable",
+                 "reason": "fewer than two groups with a selected candidate",
+                 "champion_run_spread": noise, "paired_groups": paired, "no_candidate_groups": unpaired}
+                for split in ("dev", "adjudication", "holdout")]
+    dev = [r for r in dev if r["group"] in paired]
+    final = [json.loads(line) for group in paired
+             for line in (run_dir / "final" / group / "observations.jsonl").read_text().splitlines()]
+    purpose_of = {}
     for group in GROUPS:
         splits = carve_splits(frozen_tasks(root, group), {group: list(DEV_IDS)})
-        for purpose, items in by_purpose.items():
-            items.update({item: group for item in splits.item_ids(purpose)})
-    def arm(name, items):
-        return [r for r in rows if r["arm"] == name and r["item_id"] in items]
-    splits = {p: {"outcome": outcome, "group_of": g, "champion": arm("champion", g), "candidate": arm("candidate", g)}
-              for p, g in by_purpose.items()}
-    every = {k: v for g in by_purpose.values() for k, v in g.items()}
-    splits["control"] = {"outcome": outcome, "group_of": every, "champion": arm("champion", every),
-                         "candidate": arm("control", every)}
+        purpose_of.update({item: purpose for purpose in ("adjudication", "holdout")
+                           for item in splits.item_ids(purpose)})
+
+    def arm(source, name, items):
+        return [r for r in source if r["arm"] == name and r["item_id"] in items]
+    tables = {}
+    for purpose, source in (("dev", dev), ("adjudication", final), ("holdout", final)):
+        group_of = {r["item_id"]: r["group"] for r in source
+                    if purpose == "dev" or purpose_of.get(r["item_id"]) == purpose}
+        tables[purpose] = {"outcome": outcome, "group_of": group_of,
+                           "champion": arm(source, "champion", group_of),
+                           "candidate": arm(source, "candidate", group_of)}
     entropy = json.loads((run_dir / "entropy.json").read_text())["entropy"]
-    return report_table(splits, list(range(RUNS)), entropy)
+    return [{**row, "champion_run_spread": noise, "paired_groups": paired, "no_candidate_groups": unpaired}
+            for row in report_table(tables, list(range(RUNS)), entropy)]
 
 
 def _docker_replay(solver) -> Callable[[Path], bytes]:
@@ -532,24 +648,33 @@ def main(argv=None) -> int:
         out = Path(OUT_TARGET)
         _propose_in_container(Path(DEV_TARGET), out, http_model(out / "calls.jsonl"))
         return 0
-    parser.add_argument("phase", choices=("optimise", "final"))
+    parser.add_argument("phase", choices=("optimise", "final", "rebind"))
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--group", choices=GROUPS)
+    parser.add_argument("--addendum", type=Path)
     args = parser.parse_args(argv)
+    if args.phase != "optimise" and args.group is None:
+        parser.error(f"{args.phase} needs --group")
     # Config: root, run_dir, champions {group: {path, sha256}}, calibration_answer, jev_url.
     config = json.loads(args.config.read_text())
     root, run_dir = Path(config["root"]), Path(config["run_dir"])
-    if args.phase == "final":
-        tasks = [t for g in GROUPS for t in frozen_tasks(root, g)]
-        solver = DockerSolver(root=root, tasks=tasks, evidence_dir=run_dir / "final/evidence",
-                              timeout=TIMEOUT, stage="acceptance")
-        results = final_phase(root=root, run_dir=run_dir, champions=config["champions"], solver=solver,
-                              calibration_answer=Path(config["calibration_answer"]),
-                              calibration_replay=_docker_replay(solver))
-        print(json.dumps({g: r.outcome for g, r in results.items()}))
+    if args.phase == "rebind":
+        if args.addendum is None:
+            parser.error("rebind needs --addendum")
+        record = rebind(root=root, run_dir=run_dir, group=args.group, champion=config["champions"][args.group],
+                        addendum=args.addendum)
+        print(json.dumps({"group": args.group, "addendum_sha256": record["addendum_sha256"]}))
         return 0
-    if args.group is None:
-        parser.error("optimise needs --group")
+    if args.phase == "final":
+        # Acceptance stage admits test tasks; one group per process (host cap 4).
+        tasks = frozen_tasks(root, args.group)
+        solver = DockerSolver(root=root, tasks=tasks, evidence_dir=run_dir / f"final/{args.group}/evidence",
+                              timeout=TIMEOUT, stage="acceptance")
+        result = final_phase(root=root, run_dir=run_dir, group=args.group, champions=config["champions"],
+                             solver=solver, calibration_answer=Path(config["calibration_answer"]),
+                             calibration_replay=_docker_replay(solver))
+        print(json.dumps({args.group: result.outcome}))
+        return 0
     from .solver_docker import PYTHON_IMAGE
     tasks = frozen_tasks(root, args.group)
     dev = [t for t in tasks if t.subset == "train" and t.task_id in DEV_IDS]
