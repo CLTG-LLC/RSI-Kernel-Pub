@@ -197,6 +197,89 @@ not in the local clone.
   artifact ran on the unchanged kernel; it says nothing about the adapters,
   which are expected to differ.
 
+## 9. D4 probe: a diagnostic, a conditional prediction and its limitation
+
+### 9.1 The probe (diagnostic, not a result)
+
+Before the S5 run, D4 was probed live with **no task content**, to find out what
+the unchanged kernel's D4 asks and how the model answers. The probe called the
+kernel `JevBackend` (`jev-latest`) **directly** — not through the `Decider` —
+so there is no fallback path and every answer in the table is a successful live
+response. The envelope was `EnvelopeBuilder(component_ids=("c1",), entry_ids=())`
+over a synthetic `DevPublicView`, with criteria `{add, discard}` (an empty
+library has no merge/revise target, §2). Each row was asked twice:
+
+| state | answers (2 calls each) |
+|---|---|
+| `{c1.dev_pass_count: 3, c1.dev_fail_count: 6}` | discard, discard |
+| `{c1.dev_pass_count: 6, c1.dev_fail_count: 3}` | add, add |
+| `{c1.dev_pass_count: 4, c1.dev_fail_count: 5}` | discard, discard |
+| `{}` | discard, discard |
+| `{attempt_count: 0, budget_used: 9}` | discard, discard |
+| `{attempt_count: 0, budget_used: 9, c1.dev_pass_count: 3, c1.dev_fail_count: 6}` | discard, discard |
+
+n = 12 live calls (6 states × 2), model `jev-latest`, one direct `JevBackend`,
+zero fallbacks, zero non-successful responses, no task content sent.
+Source: lane probe record, 2026-11-06.
+
+Both calls returned discard for the 3/9 and 4/9 pass states, and add for the
+6/9 pass state. Adding `attempt_count` and `budget_used` to the 3/9 state did not
+change either response. These are observations from synthetic probe states, not
+an inferred threshold and not a result.
+
+### 9.2 Conditional prediction
+
+**If** all of the following hold for a group, **then** the S5 campaign most
+likely selects no candidate:
+
+1. the champion's nine dev observations (3 tasks × 3 runs) are valid;
+2. D2 answers `c1` on each of the three attempts;
+3. three valid drafts reach D4 (D2 can answer `none`; an empty draft skips D4);
+4. every live D4 response succeeds.
+
+Under those assumptions, a champion whose probed-state dev counts look like the
+≤ 4/9 rows (the S4 champions were 3/6, 3/6 and 4/5) would plausibly get
+`discard` ×3 → no candidate → no final solves → `acceptance.json` =
+`no_improvement` → the report's status is "unavailable".
+
+This is a **hypothesis from the observed states, not a threshold**, and it is
+not a prediction of the reported numbers. A fallback `discard` (timeout,
+malformed, off-list answer) is an **operational outcome, not a Jev choice**, and
+must be reported as such — never counted as agreement with the baseline.
+
+### 9.3 How an all-discard run is reported
+
+If every D4 response is `discard`, the report says:
+
+> Jev matched the recorded discard baseline on every successful D4 response; no
+> improvement was demonstrated, and paired efficacy comparisons are unavailable.
+
+Agreement is **not** evidence that the proposed entries were bad: the entries
+were never evaluated, because D4 is admission, not a quality judgement (§3).
+
+### 9.4 Limitation: the D4 state cannot see the proposed entry
+
+The kernel is frozen for #6, and its D4 envelope carries the champion's state
+only (`loop.py:143–198`; `docs/design.md:33–55`). The D4 request therefore
+describes **the champion, not the proposed entry**, so a D4 `discard` is a
+statement about the champion's dev record as much as about the draft. Adding
+post-evaluation or entry-level metrics to admission would change the registered
+flow, so it is **not applied in S5**; the remedy is deferred to a later kernel
+slice. S5 runs as pre-registered (option a: run it and disclose the limit).
+
+### 9.5 Spend and exposure
+
+- **Expected spend on the all-discard path: 18 calls per group** = 9 solver
+  (champion dev: 3 tasks × 3 runs) + 3 proposer + 3 D2 + 3 D4. The §4 cap of
+  **45 is unchanged**; the difference is unused headroom, not a lower cap.
+- The probe's 12 calls and the pre-run smoke are **diagnostic/operational
+  calls, metered separately** from the per-group campaign cap.
+- **Task-content exposure: none added by the probe** (numeric state only, no
+  task text). S5 itself still adds 9 champion dev solves per group plus the one
+  smoke solve on an already exposed dev task (§1, §6).
+- The §6 **S4 pending counts are resolved from the S4 run records before any S5
+  solve**, as §6 requires.
+
 ## Sources
 
 - Local: `docs/prereg-gdpevo-pilot.md`; `docs/prereg-s4-addendum.md` (the trimmed
@@ -206,3 +289,7 @@ not in the local clone.
   `codex/guides/metric_and_scoring.md:115–139`.
 - [Kernel `pilot._code_hash`](../src/rsi_kernel/adapters/gdpevo/pilot.py): the
   full-code hash semantics this addendum reuses for both identities.
+- TypeSafe Choice and State primitives, whose add/discard choice and
+  champion-level state D4 mirrors: https://docs.typesafe.ai/primitives/choice,
+  https://docs.typesafe.ai/concepts/state
+- Lane probe record, 2026-11-06 (the §9.1 table; 12 live calls, direct backend).

@@ -758,6 +758,65 @@ def test_library_optimise_wiring_uses_one_proposer_d2_and_d4_per_attempt(library
     assert MEMORY not in (library_tree[0][1] / "task_group_001/calls.jsonl").read_text()
 
 
+class DiscardFakes(LibraryFakes):
+    """Library fakes whose live D4 answers discard on every attempt (addendum §9)."""
+
+    @property
+    def jev(self):
+        fakes = self
+
+        class Jev:
+            name, model = "jev", "jev-latest"
+
+            def decide(self, envelope):
+                fakes.jev_calls.append(envelope)
+                return {name: ("c1" if name == "D2" else "discard") for name in envelope["questions"]}
+        return Jev()
+
+
+def test_library_all_discard_wiring_selects_nothing_and_reports_unavailable(library_tree):
+    """Addendum §9: every D4 discard is no candidate, no final solve, "unavailable"."""
+    run_dir, root = library_tree[0][1], library_tree[0][0]
+    fakes = DiscardFakes()
+    results = {}
+    for group in pilot.GROUPS:
+        results[group] = optimise_library(library_tree, fakes, group)
+        # 3 attempts -> 3 D4 discards -> no candidate; only the champion's dev ran.
+        assert json.loads((run_dir / group / "campaign.json").read_text())["selected"] is None
+        outcomes = [json.loads(line) for line in
+                    (run_dir / group / "outcomes.jsonl").read_text().splitlines()]
+        assert [o["outcome"] for o in outcomes] == ["no_candidate"] * pilot.MAX_ATTEMPTS
+        assert results[group].selected is None
+        assert results[group].outcome == "no_improvement"
+        assert results[group].evaluator_items_used == len(pilot.DEV_IDS) * pilot.RUNS == 9
+        calls = [json.loads(line) for line in (run_dir / group / "calls.jsonl").read_text().splitlines()]
+        kinds = [call["kind"] for call in calls]
+        # 9 champion dev solver + 3 proposer + 3 D2 + 3 D4 = 18 expected, well under the 45 cap.
+        assert (kinds.count("solver"), kinds.count("proposer"), kinds.count("jev")) == (9, 3, 6)
+        assert len(calls) == 18 < library_tree[2].SPEND_CAP
+        decisions = [json.loads(line) for line in
+                     (run_dir / group / "decisions.jsonl").read_text().splitlines()]
+        d4 = [d for d in decisions if "D4" in d["envelope"]["questions"]]
+        # Three real D4 records: Jev said discard, matching the recorded baseline, no fallback.
+        assert len(d4) == 3 == pilot.MAX_ATTEMPTS
+        assert [d["answer"] for d in d4] == [{"D4": "discard"}] * 3
+        assert all(d["baseline_answer"] == {"D4": "discard"} for d in d4)
+        assert not any("fallback_reason" in d for d in decisions)
+    # No candidate anywhere: the final phase solves nothing and is not an update.
+    fakes.solver_calls.clear()
+    for group in pilot.GROUPS:
+        result = final_library(library_tree, fakes, group)
+        assert result.outcome == "no_improvement"
+        assert json.loads((run_dir / group / "acceptance.json").read_text()) == {"outcome": "no_improvement"}
+        assert (run_dir / f"final/{group}/observations.jsonl").read_text() == ""
+    assert not fakes.solver_calls  # the final solver is never invoked
+    rows = pilot.report(run_dir, root, "no_improvement")
+    assert [row["split"] for row in rows] == ["dev", "adjudication", "holdout"]
+    assert all(row["comparison"] == "unavailable" and row["paired_groups"] == [] for row in rows)
+    assert all(row["no_candidate_groups"] == list(pilot.GROUPS) for row in rows)
+    assert all(row["reason"] == "fewer than two groups with a selected candidate" for row in rows)
+
+
 def test_library_final_42_observations_stage_the_rendered_skill(library_tree):
     """S5 addendum §"final phase": #36's trimmed shape, with the library rendered per solve."""
     fakes = LibraryFakes()
