@@ -370,3 +370,73 @@ def test_optional_baseline_comparisons_use_recorded_answers_only(memory):
         {"seq": 2, "answer": "revise:e1", "baseline_answer": "discard", "disagrees": True},
         {"seq": 4, "answer": "discard", "baseline_answer": "discard", "disagrees": False},
     ]
+
+
+# S5 addendum: host-side D4 admission and DockerSolver result preservation (issue #35).
+
+
+def test_dict_solver_result_survives_without_host_regrade(memory_host, host):
+    """DockerSolver already graded in isolation; the host must not regrade (addendum D4 placement)."""
+    memory_host._memory_solver = lambda rendered, item_id, input_dir, prediction, env: {
+        "item_id": item_id, "score": 0.25, "evidence_dir": "/synthetic/evidence",
+        "failure": {"status": "STOP", "reason": "solver"}}
+    result = memory_host.evaluate(memory_host.get_artifact(), ["toy/train/001"])[0]
+    # The toy evaluator always scores 1.0, so 0.25 with its failure metadata proves no regrade.
+    assert result["score"] == 0.25
+    assert result["failure"] == {"status": "STOP", "reason": "solver"}
+    assert result["evidence_dir"] == "/synthetic/evidence"
+    assert result["feedback"] == {"score": 0.25, "correct": False}
+    assert not host[4]  # the injected callable already ran once and only once
+
+
+def test_final_phase_render_happens_once_per_evaluation(memory_host, monkeypatch):
+    from rsi_kernel.adapters.gdpevo.adapter import _verify_task
+    adapter_module = importlib.import_module("rsi_kernel.adapters.gdpevo_memory.adapter")
+    renders, original = [], adapter_module.render_skill
+    monkeypatch.setattr(adapter_module, "render_skill",
+                        lambda candidate: renders.append(candidate.id) or original(candidate))
+    # evaluate() renders the batch once; the solver then receives that rendered artifact.
+    memory_host.evaluate(memory_host.get_artifact(), ["toy/train/001"])
+    assert len(renders) == 1
+    # The final phase calls _evaluate_one directly with the host library: exactly one render.
+    task = memory_host.tasks["toy/train/002"]
+    memory_host._evaluate_one(memory_host.get_artifact(), "toy/train/002", _verify_task(memory_host.root, task))
+    assert len(renders) == 2
+
+
+def test_admit_draft_state_is_artifact_counts_only(memory, memory_host):
+    backend = ChoiceBackend("add")
+    rows = [{"score": 1.0}, {"score": 0.0}, {"score": None, "failure": {"reason": "solver"}}]
+    candidate = memory.admit_draft(memory_host.get_artifact(),
+                                   json.dumps(brief("Changed")), Decider(backend, io.StringIO()), rows)
+    assert memory.read_library(candidate) == {"e1": brief(), "e2": brief("Changed")}
+    request = backend.requests[0]
+    assert request["state"] == {"c1.dev_pass_count": 1, "c1.dev_fail_count": 2}
+    assert CANARY not in json.dumps(request)
+
+
+@pytest.mark.parametrize("extra", [{"choice": "add"}, {"id": "e9"}, {"entry_id": "e9"},
+                                   {"operation": "add"}, {"envelope": {}}, {"state": {}}])
+def test_container_draft_cannot_supply_d4_fields(memory, memory_host, extra):
+    with pytest.raises(ValueError):
+        memory.admit_draft(memory_host.get_artifact(), json.dumps({**brief("Changed"), **extra}),
+                           Decider(ChoiceBackend("add"), io.StringIO()), [{"score": 1.0}])
+
+
+def test_container_draft_is_ignored_for_ids_and_operation(memory, memory_host):
+    backend = ChoiceBackend("add")
+    # The host issues ids and the operation; the draft only supplies brief text.
+    candidate = memory.admit_draft(memory_host.get_artifact(), json.dumps(brief("Changed")),
+                                   Decider(backend, io.StringIO()), [{"score": 1.0}])
+    assert set(memory.read_library(candidate)) == {"e1", "e2"}
+    assert list(backend.requests[0]["questions"]["D4"]["criteria"]) == ["add", "merge:e1", "revise:e1", "discard"]
+
+
+def test_malformed_or_empty_draft_skips_d4(memory, memory_host):
+    backend = ChoiceBackend("add")
+    assert memory.admit_draft(memory_host.get_artifact(), None, Decider(backend, io.StringIO()),
+                              [{"score": 1.0}]) is None
+    assert not backend.requests
+    with pytest.raises(ValueError):
+        memory.admit_draft(memory_host.get_artifact(), "{}", Decider(backend, io.StringIO()), [{"score": 1.0}])
+    assert not backend.requests

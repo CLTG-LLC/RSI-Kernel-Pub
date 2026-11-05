@@ -593,6 +593,7 @@ def test_proposer_timeout_kills_and_verifies_named_container(tree, monkeypatch):
     assert not any(a[:2] in (["docker", "rm"], ["docker", "network"]) for a in after)  # evidence kept
 
 
+
 def test_rebind_cannot_swap_the_champion_even_if_the_record_agrees(tree, tmp_path, monkeypatch):
     """PR #37 review S1: frozen, current and recorded champion ids must all agree."""
     package = drift_package(tmp_path, monkeypatch)
@@ -668,3 +669,210 @@ def test_report_marks_comparison_unavailable_below_two_paired_groups(tree, selec
     assert [r["split"] for r in rows] == ["dev", "adjudication", "holdout"]
     assert all(r["comparison"] == "unavailable" and r["paired_groups"] == list(selected) for r in rows)
     assert all(r["champion_run_spread"] == 0.0 for r in rows)
+
+# S5 library artifact through the same driver (issue #35 addendum).
+
+MEMORY = "SYNTHETIC_ENTRY_CANARY"
+# Addendum §1: empty seed library, in the pilot's own candidate serialization.
+EMPTY_SEED = {"components": {}, "media_type": "application/json", "parent_ids": []}
+
+
+def brief(action):
+    return {"task_pattern": "Toy JSON tasks", "action": action,
+            "completion_criteria": "The toy answer passes", "pointers": ["toy/input/prompt.txt"]}
+
+
+@pytest.fixture
+def library_tree(tree, tmp_path):
+    """The skill tree plus a champion library file per group (empty seed, addendum)."""
+    from rsi_kernel.adapters.gdpevo_memory import pilot as memory_pilot
+    root, run_dir, champions, answer = tree
+    libraries = {}
+    for group in pilot.GROUPS:
+        path = tmp_path / f"{group}-library.json"
+        path.write_text(json.dumps(EMPTY_SEED), encoding="utf-8")
+        libraries[group] = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    return tree, libraries, memory_pilot
+
+
+class LibraryFakes(Fakes):
+    """Same fakes, with a library-shaped model and a D2+D4 Jev."""
+
+    def model(self, prompt):
+        self.model_calls.append(prompt)
+        return "```json\n" + json.dumps(brief(f"Improved skill {len(self.model_calls)} {MEMORY}")) + "\n```"
+
+    @property
+    def jev(self):
+        fakes = self
+
+        class Jev:
+            name, model = "jev", "jev-latest"
+
+            def decide(self, envelope):
+                fakes.jev_calls.append(envelope)
+                return {name: ("c1" if name == "D2" else "add") for name in envelope["questions"]}
+        return Jev()
+
+
+def optimise_library(library_tree, fakes, group):
+    (root, run_dir, _, answer), libraries, memory_pilot = library_tree
+    return pilot.optimise_group(root=root, run_dir=run_dir, group=group, champion=libraries[group],
+                                solver=fakes.solver, proposer=pilot.in_process_proposer(
+                                    fakes.model, hooks=memory_pilot.LIBRARY),
+                                jev=fakes.jev, calibration_answer=answer,
+                                calibration_replay=fakes.replay, hooks=memory_pilot.LIBRARY)
+
+
+def final_library(library_tree, fakes, group, wait=approve_matching):
+    (root, run_dir, _, answer), libraries, memory_pilot = library_tree
+    return pilot.final_phase(root=root, run_dir=run_dir, group=group, champions=libraries,
+                             solver=fakes.solver, calibration_answer=answer,
+                             calibration_replay=fakes.replay, wait=wait, hooks=memory_pilot.LIBRARY)
+
+
+def test_library_optimise_wiring_uses_one_proposer_d2_and_d4_per_attempt(library_tree):
+    fakes = LibraryFakes()
+    result = optimise_library(library_tree, fakes, "task_group_001")
+    assert result.selected is not None
+    calls = [json.loads(line) for line in
+             (library_tree[0][1] / "task_group_001/calls.jsonl").read_text().splitlines()]
+    # 4 dev evaluations x 3 tasks x 3 runs = 36 solver, plus 3 proposer, 3 D2 and 3 D4.
+    kinds = [call["kind"] for call in calls]
+    assert kinds.count("solver") == 36
+    assert kinds.count("proposer") == 3
+    assert kinds.count("jev") == 6
+    assert len(calls) == 45 == library_tree[2].SPEND_CAP
+    decisions = [json.loads(line) for line in
+                 (library_tree[0][1] / "task_group_001/decisions.jsonl").read_text().splitlines()]
+    # D2 opens each attempt and D4 follows inside that attempt's PROPOSE.
+    assert [next(iter(d["envelope"]["questions"])) for d in decisions] == ["D2", "D4"] * pilot.MAX_ATTEMPTS
+    d4 = [d for d in decisions if "D4" in d["envelope"]["questions"]]
+    assert all(d["baseline_answer"] == {"D4": "discard"} for d in d4)
+    for record in d4:
+        assert set(record["envelope"]["state"]) == {"c1.dev_pass_count", "c1.dev_fail_count"}
+    # The canary is in every admitted entry, so its absence from the log proves no entry text leaks.
+    from rsi_kernel.adapters.gdpevo_memory import read_library
+    assert MEMORY in json.dumps(read_library(result.selected))
+    assert MEMORY not in (library_tree[0][1] / "task_group_001/decisions.jsonl").read_text()
+    assert MEMORY not in (library_tree[0][1] / "task_group_001/calls.jsonl").read_text()
+
+
+def test_library_final_42_observations_stage_the_rendered_skill(library_tree):
+    """S5 addendum §"final phase": #36's trimmed shape, with the library rendered per solve."""
+    fakes = LibraryFakes()
+    group = "task_group_001"
+    optimise_library(library_tree, fakes, group)
+    seen = []
+    solver = fakes.solver
+
+    def staged(candidate, item_id, input_dir, prediction, env):
+        staged_skill = (input_dir.parent / "SKILL.md").read_bytes()
+        assert Candidate({"SKILL.md": staged_skill}, "text/plain").id == candidate.id
+        seen.append(candidate.id)
+        return solver(candidate, item_id, input_dir, prediction, env)
+
+    fakes.solver, fakes.solver_calls = staged, []
+    result = final_library(library_tree, fakes, group)
+    rows = [json.loads(line) for line in
+            (library_tree[0][1] / f"final/{group}/observations.jsonl").read_text().splitlines()]
+    expected = [(run, item, arm) for run in range(pilot.RUNS)
+                for item in group_items(group) for arm in pilot.ARMS]
+    assert len(rows) == len(seen) == 42
+    assert [(r["run"], r["item_id"], r["arm"]) for r in rows] == expected
+    assert {r["arm"] for r in rows} == {"champion", "candidate"}
+    # Dev is never re-run: no dev item appears in the final phase.
+    assert not {f"{group}/train/{i}" for i in pilot.DEV_IDS} & {r["item_id"] for r in rows}
+    # Both arms stage the render of their own host library: the empty-seed champion
+    # and the selected candidate. Nothing else is ever staged.
+    from rsi_kernel.adapters.gdpevo_memory import read_library, render_skill
+    selected = pilot._selected(library_tree[0][1] / group)
+    assert set(seen) == {render_skill(selected).id,
+                         render_skill(library_tree[2]._champion(library_tree[1][group])).id}
+    assert read_library(selected)  # the admitted entry is what got evaluated
+    assert result.outcome == "updated"
+    # accept() consumed every scheduled record: _Replay.check_consumed would raise otherwise.
+    assert result.holdout_results is not None
+    private = [json.loads(line) for line in
+               (library_tree[0][1] / group / "private/results.jsonl").read_text().splitlines()]
+    keys = [(r["candidate_id"], r["item_id"], r["run"]) for r in private]
+    assert len(keys) == len(set(keys)) == 2 * 7 * pilot.RUNS
+
+
+def test_library_main_requires_group_for_final_and_rebind(library_tree, tmp_path):
+    """#36 bullet: one group per process; the library entrypoint keeps that contract."""
+    _, libraries, memory_pilot = library_tree
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"root": str(library_tree[0][0]), "run_dir": str(library_tree[0][1]),
+                                  "champions": libraries, "calibration_answer": "x", "jev_url": "u"}))
+    for phase in ("final", "rebind"):
+        with pytest.raises(SystemExit):
+            memory_pilot.main([phase, "--config", str(config)])
+    # The container entrypoint still dispatches before argparse, as in the S4 driver.
+    assert memory_pilot.LIBRARY.module == "rsi_kernel.adapters.gdpevo_memory.pilot"
+
+
+def test_library_champion_file_uses_the_pilot_candidate_shape(library_tree, tmp_path):
+    _, libraries, memory_pilot = library_tree
+    from rsi_kernel.adapters.gdpevo_memory import library_candidate, read_library
+    assert read_library(memory_pilot._champion(libraries["task_group_001"])) == {}
+    seeded = library_candidate([brief("Seeded")])
+    path = tmp_path / "seeded.json"
+    path.write_text(json.dumps({"components": dict(seeded.components), "media_type": seeded.media_type,
+                                "parent_ids": []}), encoding="utf-8")
+    loaded = memory_pilot._champion({"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+    assert loaded.id == seeded.id and read_library(loaded) == {"e1": brief("Seeded")}
+    with pytest.raises(pilot.PilotStop):
+        memory_pilot._champion({**libraries["task_group_001"], "sha256": "0" * 64})
+
+
+def test_library_container_draft_with_d4_fields_is_rejected(library_tree, monkeypatch):
+    tree_, libraries, memory_pilot = library_tree
+    from rsi_kernel.adapters.gdpevo import solver_docker
+    root, run_dir = tree_[0], tree_[1]
+    tasks = pilot.frozen_tasks(root, "task_group_001")
+    solver = DockerSolver(root=root, tasks=[t for t in tasks if t.subset == "train"],
+                          evidence_dir=run_dir / "evidence", timeout=1)
+    champion = memory_pilot._champion(libraries["task_group_001"])
+    adapter = pilot._adapter(root, run_dir / "task_group_001", tasks, champion, solver, "stages",
+                             adapter_class=memory_pilot.LIBRARY.adapter_class)
+
+    def fake_run(argv, output=None, *, check=True):
+        if "propose-in-container" in argv:
+            out = Path(argv[argv.index("--mount") + 3].split(",")[1].split("=", 1)[1])
+            (out / "calls.jsonl").write_text('{"call": "started"}\n')
+            (out / "result.json").write_text(json.dumps(
+                {"draft": json.dumps({**brief("Changed"), "choice": "add", "id": "e9"})}))
+        import subprocess
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+    monkeypatch.setattr(solver, "_run", fake_run)
+    monkeypatch.setattr(solver, "_docker_environment", lambda out: solver_docker._DOCKER_ENV.set({"PATH": ""}))
+    calls = pilot._Calls(run_dir / "calls.jsonl")
+    proposer = pilot.ContainerProposer(adapter, solver, run_dir / "proposer", "img",
+                                       memory_pilot.LIBRARY)
+    with pytest.raises(ValueError):
+        proposer(champion, [], adapter.splits, calls, decider=None, dev_results=[{"score": 1.0}])
+    assert calls.count == 1  # the call is metered before the draft is rejected
+
+
+# Addendum §8: the kernel-only identity is the same `_code_hash` formula with
+# `adapters/` excluded, pinned to the frozen S4 commit.
+S4_COMMIT = "7919829"
+S4_FULL_CODE_HASH = "ad9447f6154165298314283ccec2610aec41d0d1a0c6eb1bf880adeb402ad082"
+S4_KERNEL_ONLY_HASH = "e8d7b2b5d14018ab0ff68ee5b811aa133f07f60b0843638fb395c12ee6c4d209"
+
+
+def test_addendum_identities_match_the_frozen_s4_commit(tmp_path):
+    import subprocess
+    repo = pilot.PACKAGE_DIR.parents[1]
+    tar = subprocess.run(["git", "-C", str(repo), "archive", S4_COMMIT], capture_output=True)
+    if tar.returncode != 0:  # CI checks out depth 1; the pinned commit may be absent there
+        pytest.skip(f"{S4_COMMIT} not in the local clone")
+    archive = tmp_path / "tree"
+    archive.mkdir()
+    subprocess.run(["tar", "-x", "-C", str(archive)], input=tar.stdout, check=True)
+    package, lock = archive / "src/rsi_kernel", archive / "uv.lock"
+    assert pilot._code_hash(package, lock) == S4_FULL_CODE_HASH
+    assert pilot._code_hash(package, lock, exclude=("adapters",)) == S4_KERNEL_ONLY_HASH
+    # The exclusion is what separates them: the two identities are not the same number.
+    assert S4_FULL_CODE_HASH != S4_KERNEL_ONLY_HASH

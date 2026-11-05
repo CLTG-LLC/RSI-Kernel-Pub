@@ -31,15 +31,28 @@ class GDPevoMemoryAdapter(GDPevoAdapter):
         read_library(self._library_champion)
         return self._library_champion
 
+    @staticmethod
+    def _render(candidate: Candidate) -> Candidate:
+        # The library is rendered for the traced skill exactly once per evaluation:
+        # evaluate() renders the batch, and the final phase calls _evaluate_one directly
+        # with the host artifact (#35 addendum "JSON library artifact").
+        return render_skill(candidate) if candidate.media_type == "application/json" else candidate
+
     def evaluate(self, candidate: Candidate, item_ids) -> list[dict]:
-        return super().evaluate(render_skill(candidate), item_ids)
+        return super().evaluate(self._render(candidate), item_ids)
+
+    def _evaluate_one(self, candidate: Candidate, item_id, directory) -> dict:
+        return super()._evaluate_one(self._render(candidate), item_id, directory)
 
     def _solve(self, rendered, item_id, input_dir, prediction, env):
         staged = input_dir.parent / "SKILL.md"
         staged.write_bytes(validate_skill(rendered).encode("utf-8"))
         _verify_staged(staged, rendered)
-        self._memory_solver(rendered, item_id, input_dir, prediction, env)
+        solved = self._memory_solver(rendered, item_id, input_dir, prediction, env)
         _verify_staged(staged, rendered)
+        # Preserve DockerSolver's score/failure/evidence: the host must not regrade
+        # an answer the isolated official grader already scored (#35).
+        return solved
 
     def apply(self, approved_candidate_hash: str) -> None:
         known = {self.get_artifact().id} | {record["id"] for record in self.archive.public_view().candidates()}

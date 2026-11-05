@@ -105,11 +105,18 @@ PACKAGE_DIR = Path(__file__).resolve().parents[2]
 LOCK_FILE = PACKAGE_DIR.parents[1] / "uv.lock"
 
 
-def _code_hash(package: Path | None = None, lock: Path | None = None) -> str:
+def _code_hash(package: Path | None = None, lock: Path | None = None, exclude: tuple[str, ...] = ()) -> str:
+    """sha256 over sorted (path relative to ``src/``, sha256) pairs plus uv.lock.
+
+    ``exclude`` skips top-level package directories. The S5 addendum §8 records the
+    kernel-only identity as ``_code_hash(exclude=("adapters",))``: same formula, so
+    the two identities are comparable rather than derived two different ways.
+    """
     package, lock = package or PACKAGE_DIR, lock or LOCK_FILE
     # __pycache__ is interpreter output written at import time, not frozen source.
     files = [(p.relative_to(package.parent).as_posix(), _sha(p)) for p in sorted(package.rglob("*"))
-             if p.is_file() and "__pycache__" not in p.parts]
+             if p.is_file() and "__pycache__" not in p.parts
+             and not any(part in exclude for part in p.relative_to(package).parts)]
     return hashlib.sha256(json.dumps([*files, ("uv.lock", _sha(lock))]).encode()).hexdigest()
 
 
@@ -144,11 +151,52 @@ def _champion(config: Mapping) -> Candidate:
     return Candidate({"SKILL.md": Path(config["path"]).read_text(encoding="utf-8")}, "text/plain")
 
 
-def _adapter(root, group_dir, tasks, champion, solver, work):
+def _adapter(root, group_dir, tasks, champion, solver, work, adapter_class=GDPevoAdapter):
     archive = Archive(group_dir / "public", group_dir / "private")
     splits = carve_splits(tasks, {tasks[0].group: list(DEV_IDS)})
-    return GDPevoAdapter(root=root, champion=champion, tasks=tasks, splits=splits, solver=solver,
+    return adapter_class(root=root, champion=champion, tasks=tasks, splits=splits, solver=solver,
                          evaluator_timeout=TIMEOUT, work_dir=group_dir / work, archive=archive)
+
+
+@dataclasses.dataclass(frozen=True)
+class Hooks:
+    """Artifact-specific pilot hooks (issue #35); ``SKILL`` is the frozen prereg default.
+
+    Only these differ between the S4 skill artifact and the S5 library (addendum
+    "JSON library artifact"): how the champion is loaded, the adapter class, the
+    text the proposer container sees, that container's entrypoint and payload
+    field, host admission, and the spend cap. ``container`` runs in the container
+    on the rendered text; ``admit`` turns its payload into a candidate on the
+    host, inside the logical PROPOSE and before evaluation.
+    """
+
+    load_champion: Callable[[Mapping], Candidate]
+    adapter_class: type
+    render: Callable[[Candidate], Candidate]  # host artifact -> text the container sees
+    module: str  # container entrypoint, run as ``python -m <module> propose-in-container``
+    result_key: str  # result.json field carrying the container's payload
+    container: Callable[..., object]  # (text champion, records, splits, model) -> payload
+    admit: Callable[..., Candidate | None]  # (champion, payload, decider, dev_results)
+    spend_cap: int
+
+
+def _skill_container(champion, records, splits, model):
+    candidate = propose(champion, records, splits, model)
+    return None if candidate is None else candidate.components["SKILL.md"]
+
+
+def _admit_skill(champion, payload, decider, dev_results):
+    # The skill artifact has no D4: the container's text is the candidate itself (#27).
+    if payload is None:
+        return None
+    candidate = Candidate({"SKILL.md": payload}, "text/plain", parent_ids=(champion.id,))
+    validate_skill(candidate)
+    return candidate
+
+
+SKILL = Hooks(load_champion=_champion, adapter_class=GDPevoAdapter, render=lambda champion: champion,
+              module="rsi_kernel.adapters.gdpevo.pilot", result_key="skill",
+              container=_skill_container, admit=_admit_skill, spend_cap=SPEND_CAP)
 
 
 class _Calls:
@@ -192,17 +240,18 @@ class _MeteredBackend:
         return self.backend.decide(envelope)
 
 
-def in_process_proposer(model):
+def in_process_proposer(model, hooks=SKILL):
     """Host-process proposer for the wiring tests: fake model, no network."""
-    def run(champion, records, splits, calls):
+    def run(champion, records, splits, calls, *, decider=None, dev_results=()):
         def metered(prompt):
             calls.log("proposer")
             return model(prompt)
-        return propose(champion, records, splits, metered)
+        return hooks.admit(champion, hooks.container(hooks.render(champion), records, splits, metered),
+                           decider, dev_results)
     return run
 
 
-def _proposer(adapter, run_proposer, calls):
+def _proposer(adapter, run_proposer, calls, hooks=SKILL, decider=None):
     def run(champion, component, dev_results):
         # Prereg "Isolation": only dev input/output text and projected {score, correct}.
         records = []
@@ -213,7 +262,9 @@ def _proposer(adapter, run_proposer, calls):
             records.append({"item_id": row["item_id"], "feedback": row["feedback"],
                             "input": (task.directory(adapter.root) / "input/prompt.txt").read_text(encoding="utf-8"),
                             "output": (Path(row["evidence_dir"]) / "work/answer.json").read_text(encoding="utf-8")})
-        return run_proposer(champion, records, adapter.splits, calls)
+        # Admission completes inside the logical PROPOSE, before evaluation (#35 addendum).
+        return run_proposer(champion, records, adapter.splits, calls,
+                            decider=decider, dev_results=dev_results)
     return run
 
 
@@ -224,7 +275,7 @@ def _zero_margin(comparison) -> bool:
 
 
 def optimise_group(*, root: Path, run_dir: Path, group: str, champion: Mapping, solver, proposer,
-                   jev, calibration_answer: Path, calibration_replay):
+                   jev, calibration_answer: Path, calibration_replay, hooks=SKILL):
     """``proposer(champion, records, splits, calls)``: in_process_proposer or ContainerProposer."""
     root, run_dir = Path(root), Path(run_dir)
     if group not in GROUPS or not run_dir.is_absolute():
@@ -234,19 +285,20 @@ def optimise_group(*, root: Path, run_dir: Path, group: str, champion: Mapping, 
         raise PilotStop("campaign already run")
     tasks = _prerun(root, run_dir, [group], calibration_answer, calibration_replay)[group]
     calls = _Calls(group_dir / "calls.jsonl")
-    champion = _champion(champion)
+    champion = hooks.load_champion(champion)
     identity = _identity(champion, tasks)  # frozen before any solve; final rechecks it
-    adapter = _adapter(root, group_dir, tasks, champion, _metered_solver(solver, calls), "stages")
+    adapter = _adapter(root, group_dir, tasks, champion, _metered_solver(solver, calls), "stages",
+                       adapter_class=hooks.adapter_class)
     _json(group_dir / "campaign.json", {"status": "open"})
     with (group_dir / "decisions.jsonl").open("a+", encoding="utf-8") as log, \
             (group_dir / "outcomes.jsonl").open("a+", encoding="utf-8") as outcomes:
         decider = Decider(_MeteredBackend(jev, calls), log, fallback=DeterministicBackend())
         result = run_campaign(
-            adapter=adapter, proposer=_proposer(adapter, proposer, calls), decider=decider,
+            adapter=adapter, proposer=_proposer(adapter, proposer, calls, hooks, decider), decider=decider,
             envelope_builder=EnvelopeBuilder(component_ids=("c1",)),
             dev_item_ids=sorted(adapter.splits.dev_item_ids()), evaluator_hash=_evaluator_hash(tasks),
             archive=adapter.archive, outcome_log=outcomes, non_regression=_zero_margin,
-            spend=lambda: calls.count, max_attempts=MAX_ATTEMPTS, spend_cap=SPEND_CAP,
+            spend=lambda: calls.count, max_attempts=MAX_ATTEMPTS, spend_cap=hooks.spend_cap,
             eval_cap=EVAL_CAP, runs=RUNS)
     selected = result.selected
     _json(group_dir / "campaign.json", {
@@ -358,7 +410,8 @@ def _rebind_record(run_dir: Path, group: str) -> dict | None:
     return record
 
 
-def rebind(*, root: Path, run_dir: Path, group: str, champion: Mapping, addendum: Path) -> dict:
+def rebind(*, root: Path, run_dir: Path, group: str, champion: Mapping, addendum: Path,
+           load_champion: Callable[[Mapping], Candidate] = _champion) -> dict:
     """Record a pre-measurement change of code/evaluator identity (S4 addendum, #36).
 
     ``from`` is the campaign's frozen identity, so it must equal campaign.json;
@@ -372,7 +425,7 @@ def rebind(*, root: Path, run_dir: Path, group: str, champion: Mapping, addendum
     if state.get("status") != "closed":
         raise PilotStop(f"campaign {group} is open or missing")
     frozen = {k: state.get(k) for k in ("champion_id", "evaluator_hash", "code_hash")}
-    current = _identity(_champion(champion), frozen_tasks(root, group))
+    current = _identity(load_champion(champion), frozen_tasks(root, group))
     if (group_dir / "rebind.json").exists():
         raise PilotStop(f"rebind already recorded for {group}")
     if current["champion_id"] != frozen["champion_id"]:
@@ -386,7 +439,8 @@ def rebind(*, root: Path, run_dir: Path, group: str, champion: Mapping, addendum
 
 def final_phase(*, root: Path, run_dir: Path, group: str, champions: Mapping, solver,
                 calibration_answer: Path, calibration_replay,
-                wait: Callable[[Path], None] = _wait_for_owner) -> AcceptResult:
+                wait: Callable[[Path], None] = _wait_for_owner,
+                hooks: Hooks = SKILL) -> AcceptResult:
     """One group's frozen comparison (S4 addendum, #36): adjudication and holdout only."""
     root, run_dir = Path(root), Path(run_dir)
     if group not in GROUPS or not run_dir.is_absolute():
@@ -402,7 +456,7 @@ def final_phase(*, root: Path, run_dir: Path, group: str, champions: Mapping, so
     # rebind (S4 addendum) is the only way a pre-measurement change may proceed.
     state = json.loads(state_path.read_text())
     frozen = {k: state.get(k) for k in ("champion_id", "evaluator_hash", "code_hash")}
-    champion = _champion(champions[group])
+    champion = hooks.load_champion(champions[group])
     tasks = frozen_tasks(root, group)
     if not _identity_ok(frozen, _identity(champion, tasks), champion.id, _rebind_record(run_dir, group)):
         raise PilotStop(f"frozen identity drift in {group}")
@@ -415,7 +469,8 @@ def final_phase(*, root: Path, run_dir: Path, group: str, champions: Mapping, so
             stream.write(json.dumps({"entropy": np.random.SeedSequence().entropy}) + "\n")
     except FileExistsError:
         pass
-    adapter = _adapter(root, group_dir, tasks, champion, solver, "final-stages")
+    adapter = _adapter(root, group_dir, tasks, champion, solver, "final-stages",
+                       adapter_class=hooks.adapter_class)
     candidate = _selected(group_dir)
     # Addendum "Items": adjudication and holdout only; dev is never re-run.
     adj = sorted(adapter.splits.item_ids("adjudication"))
@@ -433,6 +488,7 @@ def final_phase(*, root: Path, run_dir: Path, group: str, champions: Mapping, so
                     for arm in ARMS:
                         # evaluate()'s dev-only guard protects the optimisation loop; the
                         # final phase bypasses it deliberately, after _verify_task above.
+                        # The adapter renders its own host artifact (library -> SKILL.md).
                         row = {**adapter._evaluate_one(arms[arm], item, directory),
                                "group": group, "run": run, "arm": arm}
                         row["token_usage"] = _token_usage(row)
@@ -572,23 +628,25 @@ def http_model(calls_log: Path, url: str = PROPOSER_URL, timeout: float = TIMEOU
     return model
 
 
-def _propose_in_container(dev: Path, out: Path, model) -> None:
+def _propose_in_container(dev: Path, out: Path, model, hooks=SKILL) -> None:
     request = json.loads((dev / "request.json").read_text(encoding="utf-8"))
+    # The container only ever sees the rendered text artifact, whichever host artifact it came from.
     champion = Candidate(request["champion"], "text/plain")
     splits = load_splits({"splits": [{"name": "dev", "purpose": "dev", "selection_eligible": True,
                                       "item_ids": request["dev_item_ids"]}]})
-    candidate = propose(champion, request["records"], splits, model)
-    _json(out / "result.json", {"skill": None if candidate is None else candidate.components["SKILL.md"]})
+    payload = hooks.container(champion, request["records"], splits, model)
+    _json(out / "result.json", {hooks.result_key: payload})
 
 
 class ContainerProposer:
     """Live proposer via GDPevoProposerRuntime on a per-call --internal network whose
     only egress is the solver's forwarder (DockerSolver._forwarder, lead decision #27)."""
 
-    def __init__(self, adapter, solver, work: Path, image: str):
+    def __init__(self, adapter, solver, work: Path, image: str, hooks=SKILL):
         self.adapter, self.solver, self.work, self.image = adapter, solver, Path(work), image
+        self.hooks = hooks
 
-    def __call__(self, champion, records, splits, calls):
+    def __call__(self, champion, records, splits, calls, *, decider=None, dev_results=()):
         from . import solver_docker as sd
         import gepa
         scope = "gdp-" + secrets.token_hex(4)
@@ -598,7 +656,8 @@ class ContainerProposer:
         # Container precedent (tests/adapters/test_gdpevo_container.py): stage the kernel and GEPA.
         shutil.copytree(Path(__file__).parents[2], dev / "lib/rsi_kernel", ignore=shutil.ignore_patterns("__pycache__"))
         shutil.copytree(Path(gepa.__file__).parent, dev / "lib/gepa", ignore=shutil.ignore_patterns("__pycache__"))
-        _json(dev / "request.json", {"champion": dict(champion.components), "records": list(records),
+        _json(dev / "request.json", {"champion": dict(self.hooks.render(champion).components),
+                                     "records": list(records),
                                      "dev_item_ids": sorted(splits.dev_item_ids())})
         network, name = scope + "-pnet", scope + "-proposer"
         runtime = self.adapter.proposer_runtime(self.image, dev, output)
@@ -610,7 +669,7 @@ class ContainerProposer:
             self.solver._forwarder(out, scope, network)
             try:
                 completed = self.solver._run(runtime.docker_argv(
-                    ["python", "-m", "rsi_kernel.adapters.gdpevo.pilot", "propose-in-container"],
+                    ["python", "-m", self.hooks.module, "propose-in-container"],
                     {"PYTHONPATH": "/data/dev/lib"}), out / "proposer.log", check=False)
             except subprocess.TimeoutExpired:
                 # Runner's documented kill + verify; forwarder/networks stay as evidence.
@@ -624,12 +683,8 @@ class ContainerProposer:
         finally:
             sd._DOCKER_ENV.reset(token)
             self._meter(output / "calls.jsonl", calls)
-        skill = json.loads((output / "result.json").read_text())["skill"]
-        if skill is None:
-            return None
-        candidate = Candidate({"SKILL.md": skill}, "text/plain", parent_ids=(champion.id,))
-        validate_skill(candidate)
-        return candidate
+        return self.hooks.admit(champion, json.loads((output / "result.json").read_text())[self.hooks.result_key],
+                                decider, dev_results)
 
     @staticmethod
     def _meter(path: Path, calls) -> None:
@@ -640,13 +695,13 @@ class ContainerProposer:
                 calls.log("proposer", after.get("token_usage") if after.get("call") == "usage" else None)
 
 
-def main(argv=None) -> int:
+def main(argv=None, hooks=SKILL) -> int:
     from .solver_docker import DockerSolver
     parser = argparse.ArgumentParser(prog="python -m rsi_kernel.adapters.gdpevo.pilot")
     if (argv if argv is not None else sys.argv[1:]) == ["propose-in-container"]:
         from ...isolation import DEV_TARGET, OUT_TARGET
         out = Path(OUT_TARGET)
-        _propose_in_container(Path(DEV_TARGET), out, http_model(out / "calls.jsonl"))
+        _propose_in_container(Path(DEV_TARGET), out, http_model(out / "calls.jsonl"), hooks)
         return 0
     parser.add_argument("phase", choices=("optimise", "final", "rebind"))
     parser.add_argument("--config", required=True, type=Path)
@@ -662,7 +717,7 @@ def main(argv=None) -> int:
         if args.addendum is None:
             parser.error("rebind needs --addendum")
         record = rebind(root=root, run_dir=run_dir, group=args.group, champion=config["champions"][args.group],
-                        addendum=args.addendum)
+                        addendum=args.addendum, load_champion=hooks.load_champion)
         print(json.dumps({"group": args.group, "addendum_sha256": record["addendum_sha256"]}))
         return 0
     if args.phase == "final":
@@ -672,7 +727,7 @@ def main(argv=None) -> int:
                               timeout=TIMEOUT, stage="acceptance")
         result = final_phase(root=root, run_dir=run_dir, group=args.group, champions=config["champions"],
                              solver=solver, calibration_answer=Path(config["calibration_answer"]),
-                             calibration_replay=_docker_replay(solver))
+                             calibration_replay=_docker_replay(solver), hooks=hooks)
         print(json.dumps({args.group: result.outcome}))
         return 0
     from .solver_docker import PYTHON_IMAGE
@@ -681,12 +736,14 @@ def main(argv=None) -> int:
     group_dir = run_dir / args.group
     solver = DockerSolver(root=root, tasks=dev, evidence_dir=group_dir / "evidence", timeout=TIMEOUT)
     # Adapter used only for proposer_runtime deny paths (source root, private store).
-    adapter = _adapter(root, group_dir, tasks, _champion(config["champions"][args.group]), solver, "stages")
+    adapter = _adapter(root, group_dir, tasks, hooks.load_champion(config["champions"][args.group]), solver,
+                       "stages", adapter_class=hooks.adapter_class)
     result = optimise_group(
         root=root, run_dir=run_dir, group=args.group, champion=config["champions"][args.group], solver=solver,
-        proposer=ContainerProposer(adapter, solver, group_dir / "proposer", PYTHON_IMAGE),
+        proposer=ContainerProposer(adapter, solver, group_dir / "proposer", PYTHON_IMAGE, hooks),
         jev=JevBackend(config["jev_url"], "jev-latest"),
-        calibration_answer=Path(config["calibration_answer"]), calibration_replay=_docker_replay(solver))
+        calibration_answer=Path(config["calibration_answer"]), calibration_replay=_docker_replay(solver),
+        hooks=hooks)
     print(json.dumps({"outcome": result.outcome, "stop_reason": result.stop_reason}))
     return 0
 
