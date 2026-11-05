@@ -1,0 +1,41 @@
+[project]
+name = "rsi-kernel"
+version = "0.1.0"
+description = "Harness-level improvement loop kernel (see docs/design.md)"
+readme = "README.md"
+# PEP 639 SPDX expression: https://peps.python.org/pep-0639/
+# https://spdx.org/licenses/PolyForm-Noncommercial-1.0.0.html
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+# PyPI v0.1.4 lacks run_proposal; this exact commit declares 0.1.4.
+# https://docs.astral.sh/uv/concepts/projects/dependencies/#git
+gepa = ["gepa @ git+https://github.com/gepa-ai/gepa@3d34469165f0d604df3b48f1d5c776e9080f3da0"]
+# Pilot analysis (issue #20): scipy.stats.bootstrap(paired=True) + SeedSequence.
+analysis = ["numpy", "scipy"]
+
+[dependency-groups]
+# Exercise the real GEPA signature with an injected fake model in locked CI.
+dev = [
+    "pytest",
+    "gepa @ git+https://github.com/gepa-ai/gepa@3d34469165f0d604df3b48f1d5c776e9080f3da0",
+    "numpy",
+    "scipy",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# https://hatch.pypa.io/latest/config/metadata/#allowing-direct-references
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rsi_kernel"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

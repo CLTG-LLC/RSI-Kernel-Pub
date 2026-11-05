@@ -1,0 +1,1 @@
+This is a synthetic task. Return a JSON object with answer equal to toy-ok.
