@@ -531,3 +531,31 @@ def test_fix_invocation_cannot_supply_other_runs(archive, phase):
         result, _ = do_accept(host, archive, cand("b"), scores={"champ": .5, "b": forged},
                               approval=approve_exact, runs=3, holdout=False)
         assert result.outcome == "failed_gate" and host.applied == []
+
+
+class RecordingC1(AlwaysC1):
+    def __init__(self):
+        self.states = []
+
+    def decide(self, envelope):
+        self.states.append(envelope["state"])
+        return super().decide(envelope)
+
+
+def test_d2_state_carries_dev_metrics(archive):
+    # Issue #33: D2 must "use dev metrics only", so the schema's COMPONENT_METRICS reach it.
+    host = FakeHost(cand("champ"), {"champ": 1.0, "a": 0.5, "b": 1.0})
+    decider = RecordingC1()
+    campaign(host, SeqProposer(["a", "b"]), archive, decider=decider, max_attempts=2)
+    first, second = decider.states
+    assert first["c1.dev_pass_count"] == len(DEV) and first["c1.dev_fail_count"] == 0
+    assert "c1.dev_paired_score_delta" not in first
+    assert second["c1.dev_paired_score_delta"] == -0.5
+
+
+def test_d2_state_skips_delta_of_blocked_comparison(archive):
+    host = FakeHost(cand("champ"), {"champ": 0.0, "bad": lambda ids: [{"item_id": i} for i in ids]})
+    decider = RecordingC1()
+    campaign(host, SeqProposer(["bad", "bad2"]), archive, decider=decider, max_attempts=2)
+    assert decider.states[0]["c1.dev_fail_count"] == len(DEV)
+    assert "c1.dev_paired_score_delta" not in decider.states[1]

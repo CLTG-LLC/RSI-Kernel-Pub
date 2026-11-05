@@ -140,12 +140,24 @@ def run_campaign(*, adapter, proposer, decider, envelope_builder: EnvelopeBuilde
         _append(outcome_log, {**context, "attempt": attempts, "outcome": outcome,
                               "candidate_id": candidate.id if candidate else None, "mean_delta": delta})
 
+    # D2 is asked to choose "using dev metrics only" (decision/envelope.py), so pass the
+    # schema's COMPONENT_METRICS: champion dev pass/fail (correct = score 1.0, as in
+    # proposer feedback) per registered component, artifact-level, and the last valid
+    # paired dev delta for a component once it has one. Numbers only.
+    passed = sum(1 for r in champ_results if isinstance(r, dict) and r.get("score") == 1.0)
+    champion_metrics = {}
+    for cid in getattr(envelope_builder, "component_ids", ()):
+        champion_metrics[f"{cid}.dev_pass_count"] = passed
+        champion_metrics[f"{cid}.dev_fail_count"] = len(champ_results) - passed
+    last_delta: dict[str, float] = {}
+
     while attempts < max_attempts:
         if spend() > spend_cap:
             stop = "spend_cap"
             break
         attempts += 1
-        state = {"attempt_count": attempts - 1, "budget_used": budget.used}
+        state = {"attempt_count": attempts - 1, "budget_used": budget.used, **champion_metrics,
+                 **{f"{cid}.dev_paired_score_delta": d for cid, d in last_delta.items()}}
         envelope = envelope_builder.build(DevPublicView(state), decisions=("D2",))
         component = decider.decide(envelope)["D2"]
         if component == "none":
@@ -175,7 +187,9 @@ def run_campaign(*, adapter, proposer, decider, envelope_builder: EnvelopeBuilde
                        {"baseline": {}, "candidate": _feedback(results)})
         if comparison.blocks_acceptance:
             log("dev_failure", candidate)
-        elif not non_regression(comparison):
+            continue
+        last_delta[component] = comparison.mean_delta
+        if not non_regression(comparison):
             suppressed.add(candidate.id)
             log("dev_regression", candidate, comparison.mean_delta)
         else:
