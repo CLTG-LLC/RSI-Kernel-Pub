@@ -12,41 +12,64 @@ from rsi_kernel.candidate import Candidate
 from rsi_kernel.adapters.gdpevo.tasks import FrozenTask
 
 
-@pytest.fixture
-def docker_solver(tmp_path, monkeypatch):
-    mod = importlib.import_module("rsi_kernel.adapters.gdpevo.solver_docker")
-    root = tmp_path / "upstream"
-    task_dir = root / "data/task_groups/task_group_001/train_tasks/001"
+GROUP_001_ENDPOINTS = "GET /health\nGET /api/manifest\nGET /api/events\nPOST /api/judge\n"
+GROUP_002_ENDPOINTS = "GET /health\nGET /api/customers\nGET /api/quotes\nPOST /api/judge\n"
+BOTH_GROUPS = {"task_group_001": GROUP_001_ENDPOINTS, "task_group_002": GROUP_002_ENDPOINTS}
+
+
+def write_group(root, group, endpoints, task_id="001"):
+    """One synthetic group: task layout plus its own env/endpoints.txt."""
+    task_dir = root / "data/task_groups" / group / "train_tasks" / task_id
     files = {
         "input/prompt.txt": "synthetic task",
         "eval/eval.sh": "#!/bin/sh\necho '{\"total_score\": 1}'\n",
         "eval/evaluate.py": "# synthetic trusted grader\n",
+        # Grader-only reference answer: evaluators read ../output/answer.json.
+        "output/answer.json": '{"synthetic": "gold"}\n',
     }
     for name, body in files.items():
         path = task_dir / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body)
-    group = root / "data/task_groups/task_group_001"
-    (group / "env").mkdir()
-    (group / "env/Dockerfile").write_text("FROM python:3.12-slim\nCOPY server.py /server.py\n")
-    (group / "env/server.py").write_text("# synthetic environment\n")
-    (group / "task_group.yaml").write_text("state_mode: read_only\n")
-    prompt = root / "evaluation/eval_workspace/codex/guides/agent_prompts.md"
-    prompt.parent.mkdir(parents=True)
-    prompt.write_text("## Test Solver\n```text\nAttempt <unique_eval_attempt_id>, condition <base|fewshot|self|reflect-3>.\n```\n")
-    hashes = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
-              for p in root.rglob("*") if p.is_file()}
-    monkeypatch.setattr(mod, "UPSTREAM_HASHES", hashes)
-    task = FrozenTask("task_group_001", "train", "001", {
+    env = root / "data/task_groups" / group / "env"
+    env.mkdir(parents=True, exist_ok=True)
+    (env / "Dockerfile").write_text("FROM python:3.12-slim\nCOPY server.py /server.py\n")
+    (env / "server.py").write_text("# synthetic environment\n")
+    (env / "endpoints.txt").write_text(endpoints)
+    (root / "data/task_groups" / group / "task_group.yaml").write_text("state_mode: read_only\n")
+    return FrozenTask(group, "train", task_id, {
         name: hashlib.sha256((task_dir / name).read_bytes()).hexdigest() for name in files
     })
-    solver = mod.DockerSolver(root=root, tasks=[task], evidence_dir=tmp_path / "evidence", timeout=60)
-    fake = FakeDocker(root, solver)
-    monkeypatch.setattr(mod.subprocess, "run", fake)
-    incoming = tmp_path / "incoming/input"
-    incoming.mkdir(parents=True)
-    (incoming / "prompt.txt").write_text(files["input/prompt.txt"])
-    return mod, solver, fake, incoming, tmp_path / "incoming/answer.json"
+
+
+@pytest.fixture
+def build_solver(tmp_path, monkeypatch):
+    """One synthetic upstream root per call; groups differ only by endpoints.txt."""
+    def build(groups):
+        mod = importlib.import_module("rsi_kernel.adapters.gdpevo.solver_docker")
+        root = tmp_path / "upstream"
+        tasks = [write_group(root, group, endpoints) for group, endpoints in groups.items()]
+        prompt = root / "evaluation/eval_workspace/codex/guides/agent_prompts.md"
+        prompt.parent.mkdir(parents=True, exist_ok=True)
+        prompt.write_text("## Test Solver\n```text\nAttempt <unique_eval_attempt_id>, condition <base|fewshot|self|reflect-3>.\n```\n")
+        hashes = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+                  for p in root.rglob("*") if p.is_file()}
+        monkeypatch.setattr(mod, "UPSTREAM_HASHES", hashes)
+        # One evidence tree per group set, so a second build in a test stays isolated.
+        evidence = tmp_path / ("evidence-" + "-".join(sorted(groups)))
+        solver = mod.DockerSolver(root=root, tasks=tasks, evidence_dir=evidence, timeout=60)
+        fake = FakeDocker(root, solver)
+        monkeypatch.setattr(mod.subprocess, "run", fake)
+        incoming = tmp_path / "incoming/input"
+        incoming.mkdir(parents=True, exist_ok=True)
+        (incoming / "prompt.txt").write_text("synthetic task")
+        return mod, solver, fake, incoming, tmp_path / "incoming/answer.json"
+    return build
+
+
+@pytest.fixture
+def docker_solver(build_solver):
+    return build_solver({"task_group_001": GROUP_001_ENDPOINTS})
 
 
 class FakeDocker:
@@ -56,6 +79,8 @@ class FakeDocker:
         self.failure = None
         self.health = ["starting", "healthy"]
         self.attach_started = False
+        self.health_body = {"ok": True}
+        self.judge_http_status = 404
 
     def __call__(self, argv, **kwargs):
         self.calls.append((argv, kwargs))
@@ -133,9 +158,9 @@ class FakeDocker:
                 if self.failure == "grader_score" and not sanity:
                     out = '{"total_score":true}'
         elif argv[1] == "run" and "python3" in argv:
-            if self.failure == "judge":
-                raise subprocess.CalledProcessError(1, argv, output="judge reachable")
-            out = '{"health_status":"ok","judge_http_status":404}'
+            if self.failure in ("judge", "health_status"):
+                raise subprocess.CalledProcessError(1, argv, output="private check")
+            out = json.dumps({"health": self.health_body, "judge_http_status": self.judge_http_status})
         if kwargs.get("stdout") is not None:
             kwargs["stdout"].write(out.encode())
             return subprocess.CompletedProcess(argv, 0, None, None)
@@ -145,11 +170,70 @@ class FakeDocker:
         return next(self.solver.evidence_dir.iterdir())
 
 
-def solve(fixture, env=None):
+def solve(fixture, env=None, item_id="task_group_001/train/001"):
     _, solver, _, incoming, prediction = fixture
     return solver(Candidate({"SKILL.md": "synthetic skill"}, "text/plain"),
-                  "task_group_001/train/001", incoming, prediction,
+                  item_id, incoming, prediction,
                   env or {"TASK_ENV_ENABLE_JUDGE": "0"})
+
+
+def test_per_group_access_note_port_and_health(docker_solver, build_solver):
+    mod, solver, fake, _, _ = docker_solver
+    assert solve(docker_solver)["score"] == 1
+    note = (fake.attempt() / "work/environment_access.md").read_text()
+    assert note.startswith("Environment base URL: http://task-env:9001/\n")
+    assert "No credentials are required." in note
+    assert "GET /api/manifest" in note and "GET /api/events" in note
+    assert "/health" not in note and "/api/judge" not in note
+    assert "instead of any localhost URL" in note
+    env = next(a for a, _ in fake.calls if "TASK_ENV_ENABLE_JUDGE=0" in a)
+    assert "TASK_ENV_PORT=9001" in env and "127.0.0.1:9001/health" in " ".join(env)
+    check = next(a for a, _ in fake.calls if "python3" in a and a[:2] == ["docker", "run"])
+    assert "task-env:9001" in check[-1]
+
+    second = build_solver({"task_group_002": GROUP_002_ENDPOINTS})
+    mod, solver, fake, _, _ = second
+    assert solve(second, item_id="task_group_002/train/001")["score"] == 1
+    note = (fake.attempt() / "work/environment_access.md").read_text()
+    assert note.startswith("Environment base URL: http://task-env:9002/\n")
+    assert "GET /api/customers" in note and "GET /api/manifest" not in note
+    assert "/health" not in note and "/api/judge" not in note
+    env = next(a for a, _ in fake.calls if "TASK_ENV_ENABLE_JUDGE=0" in a)
+    assert "TASK_ENV_PORT=9002" in env and "127.0.0.1:9002/health" in " ".join(env)
+    assert "task-env:9002" in next(a for a, _ in fake.calls if "python3" in a and a[:2] == ["docker", "run"])[-1]
+
+
+@pytest.mark.parametrize("method", ["POST /api/records", "PUT /api/records/{id}"])
+def test_non_judge_write_endpoint_stops_before_solve(build_solver, method):
+    fixture = build_solver({"task_group_001": f"GET /health\n{method}\nPOST /api/judge\n"})
+    _, _, fake, _, _ = fixture
+    result = solve(fixture)
+    assert result["failure"] == {"status": "STOP", "reason": "env_endpoint"}
+    assert not any(a[0] == "docker" for a, _ in fake.calls)
+    assert not fake.attach_started
+
+
+@pytest.mark.parametrize("failure", ["health_status", "judge"])
+def test_health_or_judge_check_failure_is_a_stop(docker_solver, failure):
+    _, _, fake, _, _ = docker_solver
+    fake.failure = failure
+    result = solve(docker_solver)
+    assert result["score"] is None and result["failure"]["status"] == "STOP"
+    assert not fake.attach_started
+
+
+def test_any_json_health_body_passes(docker_solver):
+    _, _, fake, _, _ = docker_solver
+    fake.health_body = {"ok": True, "service": "synthetic"}
+    assert solve(docker_solver)["score"] == 1
+
+
+def test_judge_check_must_still_be_404(docker_solver):
+    _, _, fake, _, _ = docker_solver
+    fake.judge_http_status = 200
+    result = solve(docker_solver)
+    assert result["failure"] == {"status": "STOP", "reason": "environment_check"}
+    assert not fake.attach_started
 
 
 def test_stage_is_exact_readonly_and_no_credentials(docker_solver):
@@ -400,24 +484,52 @@ def test_stage_verifies_only_archived_input_and_eval_subset(docker_solver):
     mod, solver, fake, incoming, _ = docker_solver
     task = next(iter(solver.tasks.values()))
     directory = task.directory(solver.root)
-    # Real GDPevo task layout: gold and notes exist but are deliberately NOT archived.
-    additions = {"output/answer.json": "SYNTHETIC_GOLD", "notes/notes.md": "SYNTHETIC_NOTES"}
-    hashes = dict(task.hashes)
-    for rel, text in additions.items():
-        path = directory / rel
-        path.parent.mkdir()
-        path.write_text(text)
-        hashes[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+    # Real GDPevo task layout: a note exists but is never archived nor mounted.
+    notes = directory / "notes/notes.md"
+    notes.parent.mkdir()
+    notes.write_text("SYNTHETIC_NOTES")
+    hashes = {**task.hashes, "notes/notes.md": hashlib.sha256(notes.read_bytes()).hexdigest()}
     task = FrozenTask(task.group, task.subset, task.task_id, hashes)
     solver.tasks = {task.item_id: task}
     out = solver.evidence_dir / "stage-only"
     out.mkdir(parents=True)
     trusted, work, _, _ = solver._stage(Candidate({"SKILL.md": "skill"}, "text/plain"),
                                       task, incoming, out, "gdp-stage-only")
+    # Gold reaches the trusted, grader-only area; notes never leave the source.
     assert set(mod._manifest(trusted / directory.relative_to(solver.root))) == {
-        "input/prompt.txt", "eval/eval.sh", "eval/evaluate.py"}
+        "input/prompt.txt", "eval/eval.sh", "eval/evaluate.py", "output/answer.json"}
     assert set(mod._manifest(work)) == {"input/prompt.txt", "skill/SKILL.md", "environment_access.md"}
     assert not any(a[0] == "docker" for a, _ in fake.calls)
+
+
+def test_grader_output_mount_is_readonly_and_solver_never_sees_it(docker_solver):
+    _, solver, fake, _, _ = docker_solver
+    assert solve(docker_solver)["score"] == 1
+    gold = (fake.attempt() / "trusted/data/task_groups/task_group_001/train_tasks/001/output").resolve()
+    graders = [a for a, _ in fake.calls if "/trusted/eval/eval.sh" in a]
+    # Sanity and final grading both get the task gold, read-only.
+    assert len(graders) == 2
+    for argv in graders:
+        assert f"type=bind,source={gold},target=/trusted/output,readonly" in argv
+        assert argv[argv.index("--network") + 1] == "none"
+    solver_run = next(a for a, _ in fake.calls if a[:2] == ["docker", "create"])
+    assert not any("/trusted/output" in arg or str(gold) in arg for arg in solver_run)
+    staged = json.loads((fake.attempt() / "stage-manifest.json").read_text())
+    assert not any(name.startswith("output/") for name in staged)
+
+
+def test_task_without_gold_gets_no_output_mount(build_solver):
+    fixture = build_solver({"task_group_001": GROUP_001_ENDPOINTS})
+    _, solver, fake, _, _ = fixture
+    task = next(iter(solver.tasks.values()))
+    # A task with no reference answer: gold is an optional staged subset.
+    (task.directory(solver.root) / "output/answer.json").unlink()
+    hashes = {name: digest for name, digest in task.hashes.items() if not name.startswith("output/")}
+    task = FrozenTask(task.group, task.subset, task.task_id, hashes)
+    solver.tasks = {task.item_id: task}
+    assert solve(fixture)["score"] == 1
+    graders = [a for a, _ in fake.calls if "/trusted/eval/eval.sh" in a]
+    assert len(graders) == 2 and not any("/trusted/output" in " ".join(a) for a in graders)
 
 
 def test_adapter_canonicalizes_temp_parent_before_solver(host, monkeypatch):
@@ -582,3 +694,48 @@ def test_fix_malformed_context_endpoint_stops_before_builds(docker_solver, monke
     result = solve(docker_solver)
     assert result["failure"]["reason"] == "docker_context_endpoint"
     assert not any("build" in a or "run" in a for a, _ in fake.calls)
+
+
+def _run_environment_check(mod, health, judge):
+    # Executes the real ENVIRONMENT_CHECK script against a local synthetic server.
+    import http.server, subprocess, sys, threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _reply(self, spec):
+            code, body, location = spec
+            self.send_response(code)
+            if location:
+                self.send_header("Location", location)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self._reply(health if self.path == "/health" else (200, b'{"ok": true}', None))
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self._reply(judge if self.path == "/api/judge" else (404, b"", None))
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        script = mod.ENVIRONMENT_CHECK.replace("http://task-env:PORT", f"http://127.0.0.1:{server.server_port}")
+        return subprocess.run([sys.executable, "-c", script], capture_output=True, timeout=30)
+    finally:
+        server.shutdown()
+
+
+def test_environment_check_script_contract():
+    # No docker_solver fixture: it replaces subprocess.run with the Docker fake.
+    from rsi_kernel.adapters.gdpevo import solver_docker as mod
+    ok = _run_environment_check(mod, (200, b'{"ok": true}', None), (404, b"", None))
+    assert ok.returncode == 0 and json.loads(ok.stdout) == {"health": {"ok": True}, "judge_http_status": 404}
+    binary = _run_environment_check(mod, (200, b"\xff\xfeok", None), (404, b"", None))
+    assert binary.returncode == 0 and json.loads(binary.stdout)["judge_http_status"] == 404
+    assert _run_environment_check(mod, (503, b"", None), (404, b"", None)).returncode != 0
+    assert _run_environment_check(mod, (302, b"", "/elsewhere"), (404, b"", None)).returncode != 0
+    assert _run_environment_check(mod, (200, b"{}", None), (200, b"{}", None)).returncode != 0
+    assert _run_environment_check(mod, (200, b"{}", None), (302, b"", "/missing")).returncode != 0

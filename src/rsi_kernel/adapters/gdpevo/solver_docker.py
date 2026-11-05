@@ -67,27 +67,27 @@ http {
   }
 }
 '''
-# Verbatim permitted access note, the reference recipe.
-ACCESS_NOTE = '''Environment base URL: http://task-env:9001/
-No credentials are required. Allowed GET endpoints: /health; /api/policies;
-/api/events and its event/orders/sponsor_packages/badges resources;
-/api/finance/invoices; /api/crm/accounts, contacts, opportunities, campaign_members;
-/api/tradeshows and its exhibitors/meeting_interest resources;
-/api/import_batches and its raw_contacts/suppression resources.
-The environment is read-only. The judge is disabled; do not call /api/judge.
-'''
-# Verbatim disposable check, the reference recipe.
+# Upstream workflow.md §2 only requires the health endpoint to answer; each group
+# returns its own JSON (group 003: {"ok": true}), so the body is recorded as-is
+# (JSON when it parses, else replacement-decoded text; encoding is never a gate).
+# Redirects are not followed, so health must itself be 2xx and judge itself 404;
+# same no-redirect handler as decision/backends.py. urlopen raises HTTPError on
+# any non-2xx. https://docs.python.org/3/library/urllib.request.html
 ENVIRONMENT_CHECK = '''import json,urllib.request,urllib.error
-base="http://task-env:9001"
-health=json.load(urllib.request.urlopen(base+"/health"))
-if health.get("status")!="ok": raise SystemExit("STOP: unhealthy environment")
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl): return None
+opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect())
+base="http://task-env:PORT"
+raw=opener.open(base+"/health").read()
+try: health=json.loads(raw)
+except ValueError: health=raw.decode("utf-8","replace")
 request=urllib.request.Request(base+"/api/judge",data=b"{}",headers={"Content-Type":"application/json"},method="POST")
 try:
-    urllib.request.urlopen(request)
+    opener.open(request)
     raise SystemExit("STOP: judge unexpectedly accessible")
 except urllib.error.HTTPError as error:
     if error.code!=404: raise SystemExit("STOP: judge-disable check did not return 404")
-print(json.dumps({"health_status":health["status"],"judge_http_status":404}))
+print(json.dumps({"health":health,"judge_http_status":404}))
 '''
 # Recipe-v6/run-one.sh:181–202. No env-key provider, login or host auth.json.
 SOLVER_COMMAND = '''set -euo pipefail
@@ -142,6 +142,43 @@ class _Stop(Exception):
     def __init__(self, reason: str):
         self.reason = reason
         super().__init__(reason)
+
+
+def _environment_port(group: str) -> int:
+    # Upstream workflow.md §2: TASK_ENV_PORT = 9000 + the task-group number.
+    match = re.fullmatch(r"task_group_(\d+)", group)
+    if match is None:
+        raise _Stop("task_group_port")
+    return 9000 + int(match.group(1))
+
+
+def _access_note(group: str, endpoints: str) -> str:
+    # Upstream workflow.md §2: base URL, required credentials, then one
+    # "METHOD /path" line per allowed endpoint; /health is never listed and
+    # /api/judge exists only for reflect-skill generation, so both are omitted.
+    port = _environment_port(group)
+    lines = []
+    for line in endpoints.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        if len(fields) != 2:
+            raise _Stop("env_endpoint")
+        method, path = fields
+        if (method, path) == ("POST", "/api/judge"):
+            continue
+        if method != "GET":
+            # No group has a non-judge POST; render none rather than guess a contract.
+            raise _Stop("env_endpoint")
+        if path != "/health":
+            lines.append(f"{method} {path}")
+    return "\n".join([
+        f"Environment base URL: http://task-env:{port}/",
+        "No credentials are required.",
+        "Allowed GET endpoints:",
+        *lines,
+        "Use this base URL instead of any localhost URL in the task inputs.",
+    ]) + "\n"
 
 
 class DockerSolver:
@@ -205,7 +242,7 @@ class DockerSolver:
             if score_from_evaluator(sanity) != 0 or "error" in sanity:
                 raise _Stop("grader_sanity")
             phase = "environment"
-            self._environment(out, scope, solver_image, task_image)
+            self._environment(out, scope, solver_image, task_image, _environment_port(task.group))
             phase = "solver"
             self._solve(out, scope, solver_image)
             phase = "trace"
@@ -313,7 +350,11 @@ class DockerSolver:
             raise _Stop("staging_manifest_mismatch")
         group_rel = f"data/task_groups/{task.group}"
         task_rel = f"{group_rel}/{task.subset}_tasks/{task.task_id}"
-        selected = [f"{group_rel}/env", f"{group_rel}/task_group.yaml", f"{task_rel}/input", f"{task_rel}/eval", PROMPT_PATH]
+        # Most upstream evaluators read ../output/answer.json (workflow.md §5 runs
+        # eval.sh in place), so the reference answer is staged for the grader only.
+        subsets = {"input", "eval"} | ({"output"} if any(n.startswith("output/") for n in task.hashes) else set())
+        selected = [f"{group_rel}/env", f"{group_rel}/task_group.yaml", PROMPT_PATH,
+                    *(f"{task_rel}/{name}" for name in sorted(subsets))]
         archived = self._run(["git", "-C", str(self.root), "archive", self.upstream_commit, *selected]).stdout
         trusted = out / "trusted"
         trusted.mkdir(mode=0o700)
@@ -335,11 +376,11 @@ class DockerSolver:
         group, task_path = trusted / group_rel, trusted / task_rel
         if "state_mode: read_only" not in (group / "task_group.yaml").read_text():
             raise _Stop("environment_not_readonly")
-        # the reference recipe archives input/eval, never task gold/notes.
+        # Staged for the grader only: input/eval plus any task gold; notes never.
         # Full source remains verified above; exact staged subset stays hash-bound.
         staged_task = FrozenTask(task.group, task.subset, task.task_id,
                                  {name: digest for name, digest in task.hashes.items()
-                                  if name.startswith(("input/", "eval/"))})
+                                  if name.startswith(("input/", "eval/", "output/"))})
         try:
             _verify_task(trusted, staged_task)
         except ValueError as error:
@@ -349,7 +390,11 @@ class DockerSolver:
         shutil.copytree(task_path / "input", work / "input")
         (work / "skill").mkdir()
         (work / "skill/SKILL.md").write_text(skill, encoding="utf-8")
-        (work / "environment_access.md").write_text(ACCESS_NOTE)
+        # Per-group note from the group's own staged, hash-bound endpoints.txt.
+        endpoints = group / "env/endpoints.txt"
+        if not endpoints.is_file():
+            raise _Stop("env_endpoints")
+        (work / "environment_access.md").write_text(_access_note(task.group, endpoints.read_text(encoding="utf-8")))
         _json(out / "stage-manifest.json", _manifest(work))
         self._prompt(trusted, out, scope)
         return trusted, work, group, task_path
@@ -406,10 +451,13 @@ class DockerSolver:
         return images
 
     def _grade(self, out, task_path, image, prediction, name, filename):
-        # Trusted official eval.sh is NEVER mounted in the solver container.
+        # Trusted official eval.sh and task gold are NEVER mounted in the solver
+        # container; workflow.md §5 runs eval.sh in place beside output/.
+        gold = task_path / "output"
+        mounts = _bind(gold, "/trusted/output") if gold.is_dir() else []
         try:
             self._run(["docker", "run", "--name", name, "--network", "none",
-                       *_bind(task_path / "eval", "/trusted/eval"), *_bind(prediction, "/prediction/answer.json"),
+                       *_bind(task_path / "eval", "/trusted/eval"), *mounts, *_bind(prediction, "/prediction/answer.json"),
                        image, "bash", "/trusted/eval/eval.sh", "/prediction/answer.json"], out / filename)
         except subprocess.TimeoutExpired:
             self._stop_timed_out(out, name)
@@ -420,16 +468,16 @@ class DockerSolver:
             raise _Stop("grader_json")
         return payload
 
-    def _environment(self, out, scope, solver_image, task_image):
+    def _environment(self, out, scope, solver_image, task_image, port):
         network = scope + "-net"
         # Coordinator addition: Docker-native egress boundary; no host firewall.
         # https://docs.docker.com/reference/cli/docker/network/create/#internal
         self._run(["docker", "network", "create", "--internal", network], out / "network-id.txt")
         self._forwarder(out, scope, network)
         self._run(["docker", "run", "-d", "--name", scope + "-env", "--network", network,
-                   "--network-alias", "task-env", "-e", "TASK_ENV_BIND=0.0.0.0", "-e", "TASK_ENV_PORT=9001",
+                   "--network-alias", "task-env", "-e", "TASK_ENV_BIND=0.0.0.0", "-e", f"TASK_ENV_PORT={port}",
                    "-e", "TASK_ENV_ENABLE_JUDGE=0", "--health-cmd",
-                   'python3 -c "import urllib.request;urllib.request.urlopen(\\"http://127.0.0.1:9001/health\\")"',
+                   f'python3 -c "import urllib.request;urllib.request.urlopen(\\"http://127.0.0.1:{port}/health\\")"',
                    task_image], out / "env-id.txt")
         deadline = time.monotonic() + self.timeout
         while True:
@@ -444,8 +492,10 @@ class DockerSolver:
                 raise _Stop("environment_timeout")
             time.sleep(1)  # reference recipe, local state poll; no health-budget invention.
         self._run(["docker", "run", "--name", scope + "-check", "--network", network,
-                   solver_image, "python3", "-c", ENVIRONMENT_CHECK], out / "environment-check.json")
-        if json.loads((out / "environment-check.json").read_text()) != {"health_status": "ok", "judge_http_status": 404}:
+                   solver_image, "python3", "-c", ENVIRONMENT_CHECK.replace("PORT", str(port))], out / "environment-check.json")
+        checked = json.loads((out / "environment-check.json").read_text())
+        # Upstream only requires the health endpoint to answer; the body is any JSON.
+        if not isinstance(checked, dict) or "health" not in checked or checked.get("judge_http_status") != 404:
             raise _Stop("environment_check")
 
     def _forwarder(self, out, scope, network):
