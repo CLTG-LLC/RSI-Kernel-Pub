@@ -10,6 +10,11 @@ license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 requires-python = ">=3.10"
 dependencies = []
 
+# PyPA entry points spec, console_scripts group:
+# https://packaging.python.org/en/latest/specifications/entry-points/
+[project.scripts]
+rsi-kernel = "rsi_kernel.cli:main"
+
 [project.optional-dependencies]
 # PyPI v0.1.4 lacks run_proposal; this exact commit declares 0.1.4.
 # https://docs.astral.sh/uv/concepts/projects/dependencies/#git

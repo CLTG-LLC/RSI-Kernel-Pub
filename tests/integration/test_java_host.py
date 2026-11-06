@@ -200,3 +200,144 @@ def test_startup_wait_is_bounded_and_kills_the_process():
     with pytest.raises(TimeoutError):
         _start(cmd, timeout=0.5)
     assert time.monotonic() - start < READY_TIMEOUT
+
+
+# -- issue #52: console entry + frozen host contract over the same Java host ----------
+
+import base64
+
+from rsi_kernel import cli as rsi_cli
+from rsi_kernel.archive import Archive
+from rsi_kernel.candidate import Candidate
+from rsi_kernel.decision.backends import DeterministicBackend
+from rsi_kernel.decision.envelope import EnvelopeBuilder
+from rsi_kernel.decision.log import Decider
+from rsi_kernel.loop import _evaluation_hash, run_campaign
+
+CHAMPION_TEXT = "Use alpha."  # EvaluatorHost.java CHAMPION
+PROPOSAL_TEXT = "Use alpha and beta."
+
+
+def _b64(text):
+    return base64.b64encode(text.encode()).decode()
+
+
+def _config(url, store, **over):
+    cfg = {
+        "campaign_id": "synthetic-1", "host_url": url, "store": str(store),
+        "component_ids": ["c1"], "evaluator_hash": "toy-keyword-v1", "code_hash": "code-v1",
+        "splits": {"splits": [
+            {"name": "dev", "purpose": "dev", "selection_eligible": True, "item_ids": DEV},
+            {"name": "adj", "purpose": "adjudication", "selection_eligible": False, "item_ids": ["a0", "a1"]},
+        ]},
+        "bounds": {"max_attempts": 2, "spend_cap": 10, "eval_cap": 100, "runs": 1},
+        "proposals": [{"media_type": "text/plain", "components": {"SKILL.md": _b64(PROPOSAL_TEXT)}}],
+    }
+    return {**cfg, **over}
+
+
+def _cli(args, tmp_path, exe=None, cwd=None):
+    cmd = [exe] if exe else [sys.executable, "-m", "rsi_kernel.cli"]
+    r = subprocess.run(cmd + args, capture_output=True, text=True, timeout=60, cwd=cwd or tmp_path)
+    return r
+
+
+def _write(path, data):
+    path.write_text(json.dumps(data))
+    return str(path)
+
+
+def _applied(url):
+    with urllib.request.urlopen(url + "/applied", timeout=10) as r:
+        return json.loads(r.read())["applied"]
+
+
+def test_get_artifact_returns_real_bytes_bound_to_content_hash(java_host):
+    host = rsi_cli.HttpHost(java_host)
+    champ = host.get_artifact()
+    assert champ.components["SKILL.md"] == CHAMPION_TEXT.encode()
+    assert champ.id == Candidate({"SKILL.md": CHAMPION_TEXT}, "text/plain").id
+
+
+def test_java_rejects_bytes_that_do_not_match_candidate_id(java_host):
+    real = Candidate({"SKILL.md": "alpha"}, "text/plain")
+    good = {"candidate_id": real.id, "item_ids": ["d0"], "components": {"SKILL.md": _b64("alpha")}}
+    status, body = _post(java_host, good)
+    assert status == 200 and body["results"][0]["score"] == 1.0  # Java recomputed the same hash
+    assert _post(java_host, {**good, "candidate_id": "0" * 64})[0] == 400
+
+
+def test_console_campaign_prints_result_json_only(java_host, tmp_path):
+    cfg = _write(tmp_path / "cfg.json", _config(java_host, tmp_path / "store"))
+    r = _cli(["run-campaign", "--config", cfg], tmp_path)
+    assert r.returncode == 0, r.stderr
+    result = json.loads(r.stdout)  # whole stdout is one JSON document
+    assert result["outcome"] == "selected"
+    assert result["selected_id"] == Candidate({"SKILL.md": PROPOSAL_TEXT}, "text/plain").id
+    assert result["champion_id"] == Candidate({"SKILL.md": CHAMPION_TEXT}, "text/plain").id
+    assert "run-campaign" in r.stderr  # logs go to stderr
+    status = _cli(["status", "--config", cfg], tmp_path)
+    assert json.loads(status.stdout)["campaign"]["selected_id"] == result["selected_id"]
+
+
+def test_console_result_equals_direct_python_invocation(java_host, tmp_path):
+    cfg = _config(java_host, tmp_path / "store")
+    r = _cli(["run-campaign", "--config", _write(tmp_path / "cfg.json", cfg)], tmp_path)
+    via_cli = json.loads(r.stdout)
+
+    direct_dir = tmp_path / "direct"
+    host = rsi_cli.HttpHost(java_host)
+    proposals = iter([Candidate({"SKILL.md": PROPOSAL_TEXT.encode()}, "text/plain")])
+    with open(direct_dir.mkdir() or direct_dir / "out.jsonl", "a+") as log, \
+            open(direct_dir / "dec.jsonl", "a+") as dec:
+        direct = run_campaign(
+            adapter=host, proposer=lambda champ, comp, rows: next(proposals, None),
+            decider=Decider(DeterministicBackend(), dec), envelope_builder=EnvelopeBuilder(("c1",)),
+            dev_item_ids=sorted(DEV), evaluator_hash="toy-keyword-v1",
+            archive=Archive(direct_dir / "pub", direct_dir / "priv"), outcome_log=log,
+            non_regression=lambda c: c.mean_delta >= 0, spend=lambda: 0,
+            max_attempts=2, spend_cap=10, eval_cap=100, runs=1)
+    assert via_cli == {"outcome": direct.outcome, "stop_reason": direct.stop_reason,
+                       "attempts": direct.attempts, "evaluator_items_used": direct.evaluator_items_used,
+                       "champion_id": host.get_artifact().id, "selected_id": direct.selected.id}
+
+
+def _approval(candidate_hash, **over):
+    rec = {"candidate_hash": candidate_hash, "evaluator_hash": "toy-keyword-v1",
+           "data_hash": _evaluation_hash(["a0", "a1"], 1), "code_hash": "code-v1", "approver": "owner"}
+    return {**rec, **over}
+
+
+def test_accept_with_mismatched_approval_hash_is_not_updated(java_host, tmp_path):
+    cfg = _write(tmp_path / "cfg.json", _config(java_host, tmp_path / "store", campaign_id="mismatch"))
+    sel = json.loads(_cli(["run-campaign", "--config", cfg], tmp_path).stdout)["selected_id"]
+    appr = _write(tmp_path / "approval.json", _approval(sel, code_hash="other-code"))
+    r = _cli(["accept", "--config", cfg, "--approval", appr], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout) == {"outcome": "not_updated", "candidate_id": sel}
+    assert sel not in _applied(java_host)
+
+
+def test_accept_with_matching_approval_applies_on_java(java_host, tmp_path):
+    cfg = _write(tmp_path / "cfg.json", _config(java_host, tmp_path / "store", campaign_id="match"))
+    sel = json.loads(_cli(["run-campaign", "--config", cfg], tmp_path).stdout)["selected_id"]
+    r = _cli(["accept", "--config", cfg, "--approval", _write(tmp_path / "a.json", _approval(sel))], tmp_path)
+    assert json.loads(r.stdout) == {"outcome": "updated", "candidate_id": sel}
+    assert sel in _applied(java_host)
+
+
+def test_wheel_console_entry_runs_from_clean_venv(java_host, tmp_path):
+    dist = tmp_path / "dist"
+    subprocess.run(["uv", "build", "--wheel", "--out-dir", str(dist), str(ROOT)],
+                   check=True, capture_output=True, timeout=300)
+    venv = tmp_path / "venv"
+    subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True, timeout=120)
+    pip = venv / "bin" / "pip"
+    subprocess.run([str(pip), "install", "-q", "--no-index", str(next(dist.glob("*.whl")))],
+                   check=True, timeout=300)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    cfg = _write(outside / "cfg.json", _config(java_host, outside / "store", campaign_id="wheel"))
+    r = _cli(["run-campaign", "--config", cfg], tmp_path, exe=str(venv / "bin" / "rsi-kernel"), cwd=outside)
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["outcome"] == "selected"

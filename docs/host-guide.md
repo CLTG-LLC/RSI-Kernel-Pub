@@ -24,7 +24,7 @@ The JSON request has `candidate_id` and `item_ids`. Java returns a `results` arr
 
 The kernel endpoint rejects invalid or non-dev requests with HTTP 400, exhausted budgets with 429, and host failures with 502. A failed host call still spends its reservation. The endpoint has no authentication and binds only to loopback. ([src/rsi_kernel/evaluator.py:71-90](../src/rsi_kernel/evaluator.py#L71-L90), [src/rsi_kernel/evaluator.py:98-106](../src/rsi_kernel/evaluator.py#L98-L106), [src/rsi_kernel/evaluator.py:118-130](../src/rsi_kernel/evaluator.py#L118-L130))
 
-This is an evaluator seam, not a complete remote adapter protocol. The Java example treats `candidate_id` as toy keyword text; it does not exercise `get_artifact` or `apply`. ([examples/java-host/EvaluatorHost.java:59-70](../examples/java-host/EvaluatorHost.java#L59-L70), [docs/results/e1b-second-host.md:60-64](results/e1b-second-host.md#L60-L64))
+The full host contract (console control plus `get_artifact`/`evaluate`/`apply` callbacks with real artifact bytes) is frozen in [design §4.1](design.md); the same Java host implements it. Without `components`, `/evaluate` still treats `candidate_id` as toy keyword text for the S6 seam. ([examples/java-host/EvaluatorHost.java:59-70](../examples/java-host/EvaluatorHost.java#L59-L70), [docs/results/e1b-second-host.md:60-64](results/e1b-second-host.md#L60-L64))
 
 ## Host isolation duties
 

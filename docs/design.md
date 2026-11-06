@@ -122,6 +122,34 @@ Benchmark figures for all backends are vendor-reported. The **NeoHorse-Jev-4B RE
 
 Splits are **carved by the kernel config, not the host**. Proteus validates split purposes at config load (`recipes/config.py:146-154`); we add an `adjudication` purpose. For a test bed that ships only exploration plus strict held-out, the kernel splits exploration into dev and adjudication, and uses the strict held-out set as holdout. The carving rule is frozen in pre-registration.
 
+### 4.1 Frozen host contract for non-Python hosts (issue #52)
+
+Synthetic Java integration only (`examples/java-host`), not a product integration. Transport is the S6 HTTP bridge, the smallest existing choice; no MCP (#50), no custom RPC.
+
+**Java → Python control.** Console entry `rsi-kernel` ([PyPA console_scripts](https://packaging.python.org/en/latest/specifications/entry-points/), `src/rsi_kernel/cli.py`). Each subcommand reads `--config <file.json>` and prints exactly one JSON object on stdout; logs go to stderr. Exit codes: 0 success, 1 runtime or config error, 2 usage error (argparse's standard code); stdout is empty on any error.
+
+| Subcommand | Calls | stdout |
+|---|---|---|
+| `run-campaign --config C` | `loop.run_campaign` | `{outcome, stop_reason, attempts, evaluator_items_used, champion_id, selected_id}` |
+| `accept --config C [--approval A]` | `loop.accept` | `{outcome, candidate_id}`; `outcome` ∈ `loop.OUTCOMES` |
+| `status --config C` | none (reads state) | `{campaign, acceptance, approval_request}` |
+
+Config `C`: `campaign_id`, `host_url`, `store` (campaign state and the public/private archive), `component_ids`, `evaluator_hash`, `code_hash`, `splits` (the `splits.load_splits` shape), `bounds` `{max_attempts, spend_cap, eval_cap, runs}`, `proposals` (frozen candidates, see artifact encoding below). `campaign_id` must be one filename component; the resolved state file (symlinks followed) must sit directly in `store`. One champion snapshot is fetched per invocation and is the only one the kernel sees; `accept` rejects a host whose champion changed since the campaign. The retention and non-regression rule is the GDPevo prereg rule, `mean_delta >= 0`. The decider is fixed to the deterministic backend, and `spend` is fixed at 0: this synthetic contract does no spend metering.
+
+Approval `A` is an `ApprovalRecord` JSON `{candidate_hash, evaluator_hash, data_hash, code_hash, approver}`. The kernel never creates it: the host or owner writes it, using the hashes from `status.approval_request`. When the approval step is reached, a missing, malformed or mismatched record gives `not_updated`; with no candidate, or a failed adjudication, `accept` returns earlier with `no_improvement` or `failed_gate`.
+
+**Python → Java callbacks** (§4 calls over HTTP on loopback). `host_url` must be plain `http` to 127.0.0.1 or ::1 (numeric only; names such as localhost are rejected because they go to the resolver), matching the Java bind; redirects are not followed and environment proxies are ignored (the `decision/backends.py` opener pattern). An artifact is `{media_type, components: {name: base64(bytes)}}`; its identity is `candidate.content_id` over the decoded bytes.
+
+| Call | HTTP | Body / reply |
+|---|---|---|
+| `get_artifact()` | `GET /artifact` | reply: champion artifact |
+| `evaluate(candidate, ids)` | `POST /evaluate` | `{candidate_id, item_ids, components}` → `{results: [{item_id, score, feedback}]}` in request order. The host recomputes `content_id` and answers 400 on mismatch. |
+| `apply(hash)` | `POST /apply` | `{candidate_id}`; record-only, as the GDPevo adapters |
+
+Without `components`, `/evaluate` keeps the S6 evaluator-seam shape that `DevEvaluatorServer` forwards.
+
+The Java example is a trusted local example, not a hardened service for arbitrary input: request sizes are unbounded and its JSON parser is not fully RFC 8259 validating.
+
 ## 5. Build vs reuse
 
 - **Build:** the thin kernel in the new repo. Not forking Proteus (about 42.6k LOC, agent-shaped) or Reef (its improver reads gate tasks).
