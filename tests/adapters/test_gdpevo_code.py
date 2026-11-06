@@ -397,3 +397,24 @@ def test_data_only_candidate_media_and_default_hooks_unchanged():
     with pytest.raises(ValueError):
         validate_skill(champion())
     assert SKILL.solver_factory is LIBRARY.solver_factory is None
+
+
+@pytest.mark.parametrize("t3", [False, True])
+def test_calibration_replay_stages_no_candidate_code(docker_solver, monkeypatch, tmp_path, t3):
+    """Issue #85: replay grades the recorded answer via the trusted grader only."""
+    from rsi_kernel.adapters.gdpevo import pilot
+    mod, solver, fake, _, _ = docker_solver
+    if t3:
+        solver = CodeDockerSolver(champion=champion(), skill=Candidate({"SKILL.md": "fixed"}, "text/plain"),
+                                  limits=LIMITS, root=solver.root, tasks=list(solver.tasks.values()),
+                                  evidence_dir=solver.evidence_dir, timeout=solver.timeout)
+        fake.solver = solver
+    monkeypatch.setattr(pilot, "frozen_tasks", lambda root, group: list(solver.tasks.values()))
+    answer = tmp_path / "recorded-answer.json"
+    answer.write_bytes(b'{"recorded": true}')
+    assert json.loads(pilot._docker_replay(solver)(answer)) == {"total_score": 1}
+    out = next(solver.evidence_dir.iterdir())
+    grade = next(argv for argv, _ in fake.calls if "/trusted/eval/eval.sh" in argv)
+    assert f"type=bind,source={out / 'calibration-answer.json'},target=/prediction/answer.json,readonly" in grade
+    assert (out / "calibration-answer.json").read_bytes() == answer.read_bytes()
+    assert not (out / "harness").exists() and not (out / "code-manifest.json").exists()

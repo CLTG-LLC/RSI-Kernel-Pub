@@ -742,7 +742,10 @@ def _docker_replay(solver) -> Callable[[Path], bytes]:
         token = sd._DOCKER_ENV.set(None)
         try:
             skill = Candidate({"SKILL.md": "calibration\n"}, "text/plain")
-            _, _, group_dir, task_path = solver._stage(skill, task, task.directory(solver.root) / "input", out, scope)
+            # Base staging only (issue #85): replay needs the trusted task/grader, never
+            # candidate code, so a subclass _stage (T3 validate_code) must not run here.
+            _, _, group_dir, task_path = sd.DockerSolver._stage(
+                solver, skill, task, task.directory(solver.root) / "input", out, scope)
             solver._docker_environment(out)
             image, _ = solver._images(out, group_dir, scope)
             shutil.copyfile(answer, out / "calibration-answer.json")
