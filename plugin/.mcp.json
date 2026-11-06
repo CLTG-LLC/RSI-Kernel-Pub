@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "rsi-kernel": {
+      "command": "rsi-kernel-mcp"
+    }
+  }
+}

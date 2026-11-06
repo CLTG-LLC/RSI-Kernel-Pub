@@ -1,0 +1,5 @@
+{
+  "name": "rsi-kernel",
+  "description": "Registers the rsi-kernel MCP server: the kernel's run_campaign, accept and status tools over stdio.",
+  "version": "0.1.0"
+}
