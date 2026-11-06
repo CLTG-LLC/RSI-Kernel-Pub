@@ -22,6 +22,8 @@ import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributeView;
 import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermission;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -241,13 +243,16 @@ public final class FirewallHost {
         if (cached != null) return cached;
         String result;
         try {
-            // Preserve champion bytes and source metadata before the guard can
-            // delete or alter the destination. Restoration never reads it again.
-            Path restore = replacementFile(guardResource, champion, true);
+            // Capture source metadata before installation; restoration never reads
+            // the destination, which the guard may delete or alter.
+            BasicFileAttributes attributes = Files.readAttributes(guardResource, BasicFileAttributes.class);
+            PosixFileAttributeView posix = Files.getFileAttributeView(guardResource, PosixFileAttributeView.class);
+            java.util.Set<PosixFilePermission> permissions = posix == null ? null : posix.readAttributes().permissions();
             try {
                 atomicReplace(guardResource, candidate);
                 result = runGuard();
             } finally {
+                Path restore = replacementFile(guardResource, champion, attributes, permissions);
                 try {
                     Files.move(restore, guardResource, StandardCopyOption.ATOMIC_MOVE,
                             StandardCopyOption.REPLACE_EXISTING);
@@ -293,13 +298,16 @@ public final class FirewallHost {
     // Restoration keeps the original timestamps; candidate installation keeps the fresh
     // write time so timestamp-based build tools (e.g. GNU Make, incremental resource
     // copies) rebuild from the candidate rather than a stale champion copy.
-    private static Path replacementFile(Path resource, byte[] bytes, boolean preserveTimes) throws IOException {
-        BasicFileAttributes attributes = Files.readAttributes(resource, BasicFileAttributes.class);
+    private static Path replacementFile(Path resource, byte[] bytes, BasicFileAttributes attributes,
+                                        java.util.Set<PosixFilePermission> permissions) throws IOException {
         Path temp = Files.createTempFile(resource.getParent(), ".guard-", ".tmp");
         try {
-            Files.copy(resource, temp, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
+            if (attributes == null) {
+                Files.copy(resource, temp, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
+            }
             Files.write(temp, bytes);
-            if (preserveTimes) {
+            if (attributes != null) {
+                if (permissions != null) Files.setPosixFilePermissions(temp, permissions);
                 Files.getFileAttributeView(temp, BasicFileAttributeView.class).setTimes(
                         attributes.lastModifiedTime(), attributes.lastAccessTime(), attributes.creationTime());
             } else {
@@ -313,7 +321,7 @@ public final class FirewallHost {
     }
 
     private static void atomicReplace(Path resource, byte[] bytes) throws IOException {
-        Path temp = replacementFile(resource, bytes, false);
+        Path temp = replacementFile(resource, bytes, null, null);
         try {
             Files.move(temp, resource, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
         } finally {

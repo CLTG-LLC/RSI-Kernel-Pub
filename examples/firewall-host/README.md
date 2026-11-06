@@ -107,13 +107,23 @@ as the termination-wait bound. A failed termination wait is operational, not a
 pass. The descendant snapshot follows the JDK's
 [`ProcessHandle`](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/ProcessHandle.html)
 API; it is not isolation against a hostile process that spawns after the snapshot.
-Before installing the candidate, the host preserves the champion bytes and
-original resource metadata in a same-directory temporary file. A `finally` block
-atomically restores that preserved file before the response, even if the guard
-deletes or modifies the destination. Unrecoverable filesystem errors return
-`500 guard_unavailable`. Guard results, including failures,
+Before installing the candidate, the host captures the original resource mode
+and timestamps in memory; the champion bytes are already held in memory. Only
+after the command finishes does a `finally` block create a same-directory temporary
+file from those bytes and attributes and atomically restore it before the response,
+even if the guard deletes or modifies the destination. No restore temporary file
+is present in the resource directory while the command runs. Unrecoverable
+filesystem errors return `500 guard_unavailable`. Guard results, including failures,
 are cached by content ID for this host process; scoring still uses each call's
 requested items. Restart the host after changing the command or offline tree.
+
+Restoration preserves the original source timestamps, so the build output may still hold
+the previous candidate after a guard run. A content-based copy step recopies it on the next
+run: `maven-resources-plugin` 3.4.0 and later use content-based change detection by default, so no
+overwrite flag is needed. Since 3.5.0, this strategy is configurable through `changeDetection` (default:
+`content`; https://maven.apache.org/plugins/maven-resources-plugin/resources-mojo.html#changeDetection).
+Build tools that decide by timestamp only need their own documented forced-recopy option
+in the guard command. The host never edits the product's build files.
 
 Standard output and error are discarded and never echoed into responses or
 evidence. With a command configured, each evidence record also includes

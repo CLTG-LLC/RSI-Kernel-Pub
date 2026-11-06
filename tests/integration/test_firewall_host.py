@@ -387,6 +387,32 @@ def test_guard_command_timeout_terminates_descendants_before_response(firewall_h
                     pass
 
 
+def test_guard_command_resource_directory_contains_only_candidate(firewall_host, tmp_path):
+    offline = tmp_path / "offline"
+    resource_dir = offline / "resources"
+    resource_dir.mkdir(parents=True)
+    resource = resource_dir / "rules.yml"
+    resource.write_bytes(CHAMPION)
+    listing = offline / "resource-listing.json"
+    script = offline / "guard.py"
+    script.write_text(
+        "import json, pathlib, sys\n"
+        "names = sorted(path.name for path in pathlib.Path('resources').iterdir())\n"
+        "pathlib.Path('resource-listing.json').write_text(json.dumps(names))\n"
+        "sys.exit(0 if names == ['rules.yml'] else 1)\n", encoding="utf-8")
+    url, log, _ = firewall_host(
+        guard_command=json.dumps([sys.executable, str(script)]),
+        guard_working_directory=str(offline), guard_resource_path=str(resource),
+        guard_timeout_seconds=READY_TIMEOUT,
+    )
+    status, reply = _request(url, "/evaluate", _candidate_body(VALID))
+    assert status == 200, f"guard saw unexpected resource files: {listing.read_text()} ({reply})"
+    assert json.loads(listing.read_text()) == ["rules.yml"]
+    assert sorted(path.name for path in resource_dir.iterdir()) == ["rules.yml"]
+    assert resource.read_bytes() == CHAMPION
+    assert _log_rows(log)[-1]["guard_status"] == "passed"
+
+
 def test_guard_command_restores_deleted_resource_before_response(firewall_host, guard_setup):
     config, resource, _, seen = guard_setup
     original = resource.stat()
