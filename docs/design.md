@@ -124,7 +124,7 @@ Splits are **carved by the kernel config, not the host**. Proteus validates spli
 
 ### 4.1 Frozen host contract for non-Python hosts (issue #52)
 
-Synthetic Java integration only (`examples/java-host`), not a product integration. Transport is the S6 HTTP bridge, the smallest existing choice; no MCP (#50), no custom RPC.
+Synthetic Java integration only (`examples/java-host`), not a product integration. Transport is the S6 HTTP bridge, the smallest existing choice; no custom RPC. MCP is offered only as the optional extra below (#50), over the same functions.
 
 **Java → Python control.** Console entry `rsi-kernel` ([PyPA console_scripts](https://packaging.python.org/en/latest/specifications/entry-points/), `src/rsi_kernel/cli.py`). Each subcommand reads `--config <file.json>` and prints exactly one JSON object on stdout; logs go to stderr. Exit codes: 0 success, 1 runtime or config error, 2 usage error (argparse's standard code); stdout is empty on any error.
 
@@ -149,6 +149,28 @@ Approval `A` is an `ApprovalRecord` JSON `{candidate_hash, evaluator_hash, data_
 Without `components`, `/evaluate` keeps the S6 evaluator-seam shape that `DevEvaluatorServer` forwards.
 
 The Java example is a trusted local example, not a hardened service for arbitrary input: request sizes are unbounded and its JSON parser is not fully RFC 8259 validating.
+
+#### MCP surface (issue #50, optional extra)
+
+A second thin entry over the same three B1 functions, for MCP hosts. It is not a product transport: the Java host remains on the HTTP bridge above, and callbacks — `get_artifact`, `evaluate`, `apply` — never travel over MCP.
+
+| Item | Value |
+|---|---|
+| Transport | stdio, [MCP 2025-11-25 transports §stdio](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports); newline-delimited JSON-RPC, stdout carries protocol messages only, logs on stderr (verified against the spec text, fetched 2026-11-06) |
+| SDK | official `mcp` 2.3.0, `MCPServer` (`src/rsi_kernel/mcp_server.py`); optional extra `[mcp]`, MIT |
+| Console script | `rsi-kernel-mcp` ([PyPA console_scripts](https://packaging.python.org/en/latest/specifications/entry-points/)); without the extra it prints how to install it and exits 1 |
+| Tools | exactly `run_campaign`, `accept`, `status` |
+| Tool arguments | `config` (the same config file `--config` takes); `accept` also `approval` (the `--approval` file) |
+| Tool result | the same JSON object the matching subcommand prints; an expected failure (bad config, host error, stale state) is an MCP tool error |
+
+**Rejected input spends nothing.** The config contract is checked once, before any host callback or evaluation, by the shared `cli._preflight`; each check reuses the kernel's own validator (`EnvelopeBuilder` id registry, `splits.load_splits`, `evaluator.Budget`'s cap rule, `loop._validate_runs`) rather than restating it, so the CLI and MCP reject the same configs. It rejects only values the kernel would reject much later, so accepted values keep their exact kernel semantics — `max_attempts: -1` still yields `no_improvement` and `1.0` still yields `selected`. The guarantee covers **rejected input only**: a runtime failure after execution has begun — a host error, a malformed evaluation row, a decision-backend failure — may already have consumed evaluator items while leaving the campaign state absent or unchanged.
+
+The SDK name changed in v2: `FastMCP` is now `MCPServer` ([migration guide](https://py.sdk.modelcontextprotocol.io/v2/migration/#fastmcp-renamed-to-mcpserver)). There is no approval-creation tool and no shell or filesystem tool, so MCP cannot mint an approval: `accept` reads a record the host or owner wrote and gives `not_updated` otherwise.
+
+```sh
+pip install 'rsi-kernel[mcp]'
+rsi-kernel-mcp          # then connect any MCP client over stdio
+```
 
 ## 5. Build vs reuse
 

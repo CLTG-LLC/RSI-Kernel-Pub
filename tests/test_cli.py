@@ -187,3 +187,50 @@ def test_fresh_status_has_exact_initial_shape(tmp_path, capsys):
     path.write_text(json.dumps(_config("http://127.0.0.1:9", tmp_path / "store")))
     assert cli.main(["status", "--config", str(path)]) == 0
     assert json.loads(capsys.readouterr().out) == {"campaign": None, "acceptance": None, "approval_request": None}
+
+
+# -- 6. rejected configuration evaluates nothing (review S2) -------------------
+
+BAD_BOUNDS = {
+    # Rejected only because they would raise anyway: a type the loop cannot compare
+    # or index, and a cap evaluator.Budget itself refuses. Values the kernel accepts
+    # (attempt counts below zero, a float attempt count) stay accepted; see below.
+    "wrong type": {"max_attempts": "invalid", "spend_cap": 1, "eval_cap": 100, "runs": 1},
+    "negative cap": {"max_attempts": 1, "spend_cap": 1, "eval_cap": -1, "runs": 1},
+    "non-positive runs": {"max_attempts": 1, "spend_cap": 1, "eval_cap": 100, "runs": 0},
+    "missing key": {"spend_cap": 1, "eval_cap": 100, "runs": 1},
+}
+
+
+@pytest.mark.parametrize("case,bounds", sorted(BAD_BOUNDS.items()))
+def test_malformed_bounds_exit_1_and_evaluate_nothing(make_host, tmp_path, capsys, case, bounds):
+    host = make_host()
+    assert _main(tmp_path, _config(host.url, tmp_path / "store", bounds=bounds)) == 1
+    out = capsys.readouterr()
+    assert out.out == "" and "bounds" in out.err
+    assert (host.artifact_calls, host.evaluated) == (0, [])
+
+
+@pytest.mark.parametrize("key", ["campaign_id", "host_url", "store", "component_ids",
+                                 "evaluator_hash", "code_hash", "splits", "bounds"])
+def test_missing_required_config_field_exits_1_before_any_callback(make_host, tmp_path, capsys, key):
+    host = make_host()
+    cfg = _config(host.url, tmp_path / "store")
+    del cfg[key]
+    assert _main(tmp_path, cfg) == 1
+    out = capsys.readouterr()
+    assert out.out == "" and key in out.err
+    assert (host.artifact_calls, host.evaluated) == (0, [])
+
+
+# -- 7. accepted bound values keep their kernel semantics (owner: never stricter) --
+
+@pytest.mark.parametrize("max_attempts,expected", [(-1, "no_improvement"), (1.0, "selected")])
+def test_bound_values_the_kernel_accepts_behave_as_before(make_host, tmp_path, capsys,
+                                                         max_attempts, expected):
+    host = make_host()
+    bounds = {"max_attempts": max_attempts, "spend_cap": 1, "eval_cap": 100, "runs": 1}
+    assert _main(tmp_path, _config(host.url, tmp_path / "store", bounds=bounds)) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["outcome"] == expected
+    assert host.evaluated != []  # the champion is always evaluated first

@@ -27,12 +27,15 @@ from .candidate import Candidate
 from .decision.backends import DeterministicBackend
 from .decision.envelope import EnvelopeBuilder
 from .decision.log import Decider
-from .loop import ApprovalRecord, _evaluation_hash, accept, run_campaign
+from .evaluator import Budget
+from .loop import ApprovalRecord, _evaluation_hash, _validate_runs, accept, run_campaign
 from .splits import load_splits
 
 TIMEOUT = 30.0  # same default as examples/java-host/http_evaluator.py
 # Numeric only: a name such as localhost goes to the resolver unchanged. Java binds 127.0.0.1.
 LOOPBACK_HOSTS = ("127.0.0.1", "::1")
+REQUIRED = ("campaign_id", "host_url", "store", "component_ids", "evaluator_hash", "code_hash", "splits", "bounds")
+BOUND_NAMES = ("max_attempts", "spend_cap", "eval_cap", "runs")
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -139,6 +142,55 @@ def _archive(config: dict) -> Archive:
     return Archive(store / "public", store / "private")
 
 
+def _number(name: str, value) -> None:
+    # loop.py compares these with > (max_attempts) and numbers only; a real number
+    # (int or float) works, a bool or str does not. Anything else is left to the kernel.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"bounds.{name} must be a number")
+
+
+def _bounds(bounds) -> dict:
+    """Reject only bound values that would raise later, after the champion evaluation."""
+    if not isinstance(bounds, dict):
+        raise ValueError("bounds must be an object")
+    missing = [name for name in BOUND_NAMES if name not in bounds]
+    if missing:
+        raise ValueError(f"bounds is missing {', '.join(missing)}")
+    _number("max_attempts", bounds["max_attempts"])
+    try:
+        Budget(bounds["eval_cap"])  # the kernel's own cap rule, not a copy of it
+    except ValueError as error:
+        raise ValueError(f"bounds.{error}") from error
+    try:
+        _validate_runs(bounds["runs"])
+    except ValueError as error:
+        raise ValueError(f"bounds.{error}") from error
+    _number("spend_cap", bounds["spend_cap"])
+    return bounds
+
+
+def _preflight(config: dict) -> Path:
+    """Validate the frozen config contract before any host callback or evaluation.
+
+    A rejected config must spend no evaluator items (review S2): the loop validates
+    lazily, after the champion evaluation has already run. Each check reuses the
+    kernel's existing validator rather than restating its rule here. Returns the
+    campaign state path.
+    """
+    if not isinstance(config, dict):
+        raise ValueError("config must be a JSON object")
+    missing = [name for name in REQUIRED if name not in config]
+    if missing:
+        raise ValueError(f"config is missing {', '.join(missing)}")
+    state_path = _state_path(config)  # campaign_id shape and store containment
+    HttpHost(config["host_url"])  # loopback-only callback URL
+    EnvelopeBuilder(tuple(config["component_ids"]))  # c<n> id registry
+    load_splits(config["splits"])  # split purposes and item ids
+    _bounds(config["bounds"])
+    [_decode(proposal) for proposal in config.get("proposals", [])]  # bytes match their hash
+    return state_path
+
+
 def _approval_request(config: dict, candidate_id: str) -> dict:
     splits = load_splits(config["splits"])
     return {"campaign_id": config["campaign_id"], "candidate_hash": candidate_id,
@@ -147,7 +199,7 @@ def _approval_request(config: dict, candidate_id: str) -> dict:
 
 
 def cmd_run_campaign(config: dict) -> dict:
-    state_path = _state_path(config)  # validate before any callback or write
+    state_path = _preflight(config)  # validate before any callback or write
     host = FrozenChampion(HttpHost(config["host_url"]))
     store = _store(config)
     champion = host.get_artifact()
@@ -186,7 +238,7 @@ def _read_approval(path: str | None):
 
 
 def cmd_accept(config: dict, approval_path: str | None) -> dict:
-    state_path = _state_path(config)
+    state_path = _preflight(config)
     state = json.loads(state_path.read_text(encoding="utf-8"))
     host = FrozenChampion(HttpHost(config["host_url"]))
     champion = host.get_artifact()
@@ -206,7 +258,7 @@ def cmd_accept(config: dict, approval_path: str | None) -> dict:
 
 
 def cmd_status(config: dict) -> dict:
-    path = _state_path(config)
+    path = _preflight(config)
     if not path.exists():
         return {"campaign": None, "acceptance": None, "approval_request": None}
     state = json.loads(path.read_text(encoding="utf-8"))

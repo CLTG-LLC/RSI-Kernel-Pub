@@ -38,19 +38,48 @@ None of these are vendored in this repository; they are installed from their own
 
 | Distribution | Version | Licence |
 |---|---|---|
+| annotated-types | 0.8.0 | MIT |
+| anyio | 4.16.0 | MIT |
+| attrs | 26.1.0 | MIT |
+| cffi | 2.1.1 | MIT-0 |
+| click | 8.5.0 | BSD-3-Clause |
 | colorama | 0.4.6 | BSD-3-Clause |
+| cryptography | 50.0.2 | Apache-2.0 OR BSD-3-Clause |
 | exceptiongroup | 1.3.1 | MIT, plus PSF licence notice for copied Python standard-library portions |
 | gepa | 0.1.4 (Git `3d34469165f0d604df3b48f1d5c776e9080f3da0`) | MIT |
+| h11 | 0.16.0 | MIT |
+| httpcore2 | 2.14.0, 2.16.0 | BSD-3-Clause |
+| httpx2 | 2.14.0, 2.16.0 | BSD-3-Clause |
+| httpx2-jsfetch | 1.0 | BSD-3-Clause (Emscripten-only marker) |
+| idna | 3.20 | BSD-3-Clause |
 | iniconfig | 2.3.1 | MIT |
+| jsonschema | 4.26.0 | MIT |
+| jsonschema-specifications | 2025.9.1 | MIT |
+| mcp | 2.3.0 | MIT |
+| mcp-types | 2.3.0 | MIT |
 | numpy | 2.2.6 | BSD-3-Clause core, with bundled-component notices |
 | numpy | 2.4.6, 2.5.4 | BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0 |
+| opentelemetry-api | 1.45.2 | Apache-2.0 |
 | packaging | 26.3 | Apache-2.0 OR BSD-2-Clause |
 | pluggy | 1.7.0 | MIT |
+| pycparser | 3.11, 3.12 | BSD-3-Clause |
+| pydantic | 2.14.3 | MIT |
+| pydantic-core | 2.50.4 | MIT |
 | pygments | 2.21.0 | BSD-2-Clause |
+| pyjwt | 2.15.1 | MIT |
 | pytest | 9.2.0 | MIT |
+| python-multipart | 0.0.32, 0.0.33 | Apache-2.0 |
+| pywin32 | 312 | PSF-2.0 (Windows-only marker) |
+| referencing | 0.37.0 | MIT |
+| rpds-py | 0.30.0, 2026.9.1 | MIT |
 | scipy | 1.15.3, 1.17.1, 1.18.1 | BSD-3-Clause core, with bundled-component licences and notices |
+| sse-starlette | 3.5.1, 3.6.0 | BSD-3-Clause |
+| starlette | 1.7.0, 1.10.0 | BSD-3-Clause |
 | tomli | 2.5.0 | MIT |
+| truststore | 0.10.5 | MIT |
 | typing-extensions | 4.16.0 | PSF-2.0 |
+| typing-inspection | 0.4.5 | MIT |
+| uvicorn | 0.54.0 | BSD-3-Clause |
 
 NumPy and SciPy binary wheels bundle further components (for example OpenBLAS/LAPACK under BSD-family licences, the GCC runtime under GPL with the GCC Runtime Library Exception, and libquadmath under LGPL). Any redistribution of those binaries, such as a bundled wheel set or container image, must keep the notices shipped inside them.
 

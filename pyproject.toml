@@ -14,6 +14,8 @@ dependencies = []
 # https://packaging.python.org/en/latest/specifications/entry-points/
 [project.scripts]
 rsi-kernel = "rsi_kernel.cli:main"
+# Optional MCP stdio server (issue #50); needs the [mcp] extra to run.
+rsi-kernel-mcp = "rsi_kernel.mcp_server:main"
 
 [project.optional-dependencies]
 # PyPI v0.1.4 lacks run_proposal; this exact commit declares 0.1.4.
@@ -21,11 +23,17 @@ rsi-kernel = "rsi_kernel.cli:main"
 gepa = ["gepa @ git+https://github.com/gepa-ai/gepa@3d34469165f0d604df3b48f1d5c776e9080f3da0"]
 # Pilot analysis (issue #20): scipy.stats.bootstrap(paired=True) + SeedSequence.
 analysis = ["numpy", "scipy"]
+# Optional MCP stdio server (issue #50): official Python SDK, MIT.
+# https://github.com/modelcontextprotocol/python-sdk
+mcp = ["mcp>=2.3.0"]
 
 [dependency-groups]
 # Exercise the real GEPA signature with an injected fake model in locked CI.
 dev = [
     "pytest",
+    # CI installs the [mcp] extra through the dev group so the MCP tests run, not skip.
+    # https://docs.astral.sh/uv/concepts/projects/dependencies/#dependency-groups
+    "rsi-kernel[mcp]",
     "gepa @ git+https://github.com/gepa-ai/gepa@3d34469165f0d604df3b48f1d5c776e9080f3da0",
     "numpy",
     "scipy",
