@@ -241,3 +241,38 @@ sys.exit(main())
 def test_core_package_never_imports_mcp():
     code = "import sys, rsi_kernel, rsi_kernel.cli; assert not [m for m in sys.modules if m.split('.')[0] == 'mcp']"
     subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, timeout=60, cwd=ROOT)
+
+
+@needs_java
+def test_client_accept_waits_for_the_owner_approval_file(java_host, tmp_path):
+    # Issue #60: accept files approval-request.json and blocks until the approval exists.
+    import threading
+    import time
+
+    store = tmp_path / "store-wait"
+    cfg = _write(tmp_path / "wait.json", _config(java_host, store, campaign_id="mcp-wait"))
+    selected = json.loads(_cli(["run-campaign", "--config", cfg], tmp_path).stdout)["selected_id"]
+    approval = tmp_path / "owner.json"
+
+    def owner():
+        request = store / "approval-request.json"
+        deadline = time.monotonic() + 60
+        while not request.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        filed = json.loads(request.read_text())
+        assert not approval.exists()
+        temp = approval.with_name(approval.name + ".tmp")  # publish atomically, as the docs say
+        temp.write_text(json.dumps({**{k: filed[k] for k in ("candidate_hash", "evaluator_hash",
+                                                              "data_hash", "code_hash")}, "approver": "owner"}))
+        os.replace(temp, approval)
+
+    writer = threading.Thread(target=owner)
+    writer.start()
+
+    async def scenario(session, init):
+        return await session.call_tool("accept", {"config": cfg, "approval": str(approval)})
+
+    result = _mcp(scenario)
+    writer.join(60)
+    assert _json(result) == {"outcome": "updated", "candidate_id": selected}
+    assert selected in _applied(java_host)

@@ -4,7 +4,8 @@ Three control operations for a non-Python host: ``run-campaign``, ``accept`` and
 ``status``. Each reads a JSON config file and prints one JSON document on stdout;
 logs go to stderr. No loop logic lives here: the subcommands call
 ``loop.run_campaign`` and ``loop.accept`` unchanged. Approval records are only
-read, never created: the host or owner writes the approval file.
+read, never created: ``accept`` files ``approval-request.json`` in the store and
+waits for the host or owner to write the approval file (issue #60).
 
 Callbacks go to the host over the S6 HTTP bridge (examples/java-host): artifacts
 travel as base64 component bytes next to their ``candidate.content_id``.
@@ -22,6 +23,7 @@ import urllib.request
 from pathlib import Path
 from typing import Sequence
 
+from .approval import file_approval, wait_for_file
 from .archive import Archive
 from .candidate import Candidate
 from .decision.backends import DeterministicBackend
@@ -36,6 +38,7 @@ TIMEOUT = 30.0  # same default as examples/java-host/http_evaluator.py
 LOOPBACK_HOSTS = ("127.0.0.1", "::1")
 REQUIRED = ("campaign_id", "host_url", "store", "component_ids", "evaluator_hash", "code_hash", "splits", "bounds")
 BOUND_NAMES = ("max_attempts", "spend_cap", "eval_cap", "runs")
+POLL_INTERVAL = 1.0  # seconds; the GDPevo pilot's owner-wait poll (approval.wait_for_file)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -125,16 +128,20 @@ def _store(config: dict) -> Path:
     return path
 
 
+def _store_file(config: dict, name: str) -> Path:
+    store = _store(config).resolve()
+    path = (store / name).resolve()  # follows symlinks
+    if path.parent != store:
+        raise ValueError(f"{name} escapes the store")
+    return path
+
+
 def _state_path(config: dict) -> Path:
     cid = config["campaign_id"]
     if (not isinstance(cid, str) or not cid or cid in (".", "..")
             or any(sep in cid for sep in ("/", "\\", "\0"))):
         raise ValueError("campaign_id must be a single filename component")
-    store = _store(config).resolve()
-    path = (store / f"campaign-{cid}.json").resolve()  # follows symlinks
-    if path.parent != store:
-        raise ValueError("campaign state path escapes the store")
-    return path
+    return _store_file(config, f"campaign-{cid}.json")
 
 
 def _archive(config: dict) -> Archive:
@@ -226,19 +233,12 @@ def cmd_run_campaign(config: dict) -> dict:
     return out
 
 
-def _read_approval(path: str | None):
-    def approval(request):
-        if path is None:
-            return None
-        try:
-            return ApprovalRecord(**json.loads(Path(path).read_text(encoding="utf-8")))
-        except (OSError, ValueError, TypeError):
-            return None  # missing or malformed: accept() records not_updated
-    return approval
-
-
 def cmd_accept(config: dict, approval_path: str | None) -> dict:
     state_path = _preflight(config)
+    # Checked before any callback: a rejected path spends no evaluation. An explicit
+    # --approval is the caller's own path and stays outside this check.
+    request_file = _store_file(config, "approval-request.json")
+    approval_file = Path(approval_path) if approval_path is not None else _store_file(config, "approval.json")
     state = json.loads(state_path.read_text(encoding="utf-8"))
     host = FrozenChampion(HttpHost(config["host_url"]))
     champion = host.get_artifact()
@@ -246,10 +246,12 @@ def cmd_accept(config: dict, approval_path: str | None) -> dict:
         raise ValueError("host champion changed since the campaign")
     candidate = _decode(state["selected"]) if state["selected"] else None
     splits = load_splits(config["splits"])
+    approval = file_approval(request_file, approval_file,
+                             lambda: wait_for_file(approval_file, POLL_INTERVAL))
     result = accept(
         campaign_id=config["campaign_id"], candidate=candidate, champion=champion, adjudicate=host.evaluate,
         adjudication_item_ids=sorted(splits.item_ids("adjudication")), evaluator_hash=config["evaluator_hash"],
-        code_hash=config["code_hash"], retain=_zero_margin, approval=_read_approval(approval_path),
+        code_hash=config["code_hash"], retain=_zero_margin, approval=approval,
         adapter=host, archive=_archive(config), runs=config["bounds"]["runs"])
     out = {"outcome": result.outcome, "candidate_id": candidate.id if candidate else None}
     state_path.write_text(json.dumps({**state, "acceptance": out}, sort_keys=True), encoding="utf-8")
@@ -274,7 +276,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         p = sub.add_parser(name)
         p.add_argument("--config", required=True, help="campaign config JSON file")
         if name == "accept":
-            p.add_argument("--approval", help="approval record JSON written by the host/owner")
+            p.add_argument("--approval", help="approval record JSON the host/owner writes; accept waits for it (default: <store>/approval.json)")
     args = parser.parse_args(argv)
     try:
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))

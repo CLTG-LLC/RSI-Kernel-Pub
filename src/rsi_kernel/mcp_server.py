@@ -54,7 +54,11 @@ def run_campaign(config: str) -> dict:
 
 
 def accept(config: str, approval: str | None = None) -> dict:
-    """Apply the campaign's selected candidate if the approval record at `approval` matches."""
+    """Apply the selected candidate once the approval record at `approval` exists and matches.
+
+    Files `approval-request.json` in the store and blocks until the approval file
+    exists (design §4.1); hosts that cannot block should run `rsi-kernel accept`.
+    """
     return _call("accept", lambda: cli.cmd_accept(_config(config), approval))
 
 

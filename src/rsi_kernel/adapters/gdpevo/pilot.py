@@ -32,6 +32,7 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Mapping
 
+from ...approval import file_approval, wait_for_file
 from ...archive import Archive
 from ...candidate import Candidate, content_id
 from ...compare import _valid_score
@@ -472,21 +473,12 @@ class _Replay:
 
 
 def _file_approval(group_dir, wait):
-    def approval(request):
-        path = group_dir / "approval-request.json"
-        _json(path, request.__dict__)
-        wait(path)
-        try:
-            return ApprovalRecord(**json.loads((group_dir / "approval.json").read_text()))
-        except (OSError, ValueError, TypeError):
-            return None  # missing or malformed: accept() records not_updated
-    return approval
+    request = group_dir / "approval-request.json"
+    return file_approval(request, group_dir / "approval.json", lambda: wait(request))
 
 
 def _wait_for_owner(path: Path) -> None:
-    # Same local-state poll as the runner's health wait; no timeout (lead stops it).
-    while not path.with_name("approval.json").exists():
-        time.sleep(1)
+    wait_for_file(path.with_name("approval.json"))
 
 
 def _selected(group_dir) -> Candidate | None:

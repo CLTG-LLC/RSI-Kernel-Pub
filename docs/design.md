@@ -131,12 +131,19 @@ Synthetic Java integration only (`examples/java-host`), not a product integratio
 | Subcommand | Calls | stdout |
 |---|---|---|
 | `run-campaign --config C` | `loop.run_campaign` | `{outcome, stop_reason, attempts, evaluator_items_used, champion_id, selected_id}` |
-| `accept --config C [--approval A]` | `loop.accept` | `{outcome, candidate_id}`; `outcome` ∈ `loop.OUTCOMES` |
+| `accept --config C [--approval A]` | `loop.accept` | `{outcome, candidate_id}`; `outcome` ∈ `loop.OUTCOMES`. Blocks at the approval step until `A` exists (see below) |
 | `status --config C` | none (reads state) | `{campaign, acceptance, approval_request}` |
 
 Config `C`: `campaign_id`, `host_url`, `store` (campaign state and the public/private archive), `component_ids`, `evaluator_hash`, `code_hash`, `splits` (the `splits.load_splits` shape), `bounds` `{max_attempts, spend_cap, eval_cap, runs}`, `proposals` (frozen candidates, see artifact encoding below). `campaign_id` must be one filename component; the resolved state file (symlinks followed) must sit directly in `store`. One champion snapshot is fetched per invocation and is the only one the kernel sees; `accept` rejects a host whose champion changed since the campaign. The retention and non-regression rule is the GDPevo prereg rule, `mean_delta >= 0`. The decider is fixed to the deterministic backend, and `spend` is fixed at 0: this synthetic contract does no spend metering.
 
-Approval `A` is an `ApprovalRecord` JSON `{candidate_hash, evaluator_hash, data_hash, code_hash, approver}`. The kernel never creates it: the host or owner writes it, using the hashes from `status.approval_request`. When the approval step is reached, a missing, malformed or mismatched record gives `not_updated`; with no candidate, or a failed adjudication, `accept` returns earlier with `no_improvement` or `failed_gate`.
+Approval `A` is an `ApprovalRecord` JSON `{candidate_hash, evaluator_hash, data_hash, code_hash, approver}`; without `--approval` it is `<store>/approval.json`. Before any callback, `accept` rejects `<store>/approval-request.json` and the default `<store>/approval.json` if they resolve outside the store (the state file's check); an explicit `--approval` is the caller's own path. The kernel never creates it. Order (issue #60, the GDPevo pilot's request-then-wait flow, `src/rsi_kernel/approval.py`):
+
+1. `accept` runs adjudication. With no candidate, or a failed adjudication, it returns `no_improvement` or `failed_gate` and files nothing.
+2. Otherwise it writes the `ApprovalRequest` `{campaign_id, candidate_hash, evaluator_hash, data_hash, code_hash}` to `<store>/approval-request.json`; `status.approval_request` reports the same hashes.
+3. It then waits, polling once a second with no timeout (the operator stops the process), until `A` exists.
+4. The owner writes `A` from those hashes, and `accept` continues: a matching record gives `updated` and calls `apply`; a present but malformed or mismatched record gives `not_updated`. Both files are published atomically, a sibling temp file then [`os.replace`](https://docs.python.org/3/library/os.html#os.replace), because `accept` reads `A` as soon as its name appears and a partial file counts as malformed.
+
+The campaign is marked adjudicated in step 1 (`loop.accept`), before the wait, so the adjudication split is spent once: stopping `accept` during the wait leaves no outcome, and a later `accept` for that campaign raises `CampaignClosed`. Write `A` rather than restarting.
 
 **Python → Java callbacks** (§4 calls over HTTP on loopback). `host_url` must be plain `http` to 127.0.0.1 or ::1 (numeric only; names such as localhost are rejected because they go to the resolver), matching the Java bind; redirects are not followed and environment proxies are ignored (the `decision/backends.py` opener pattern). An artifact is `{media_type, components: {name: base64(bytes)}}`; its identity is `candidate.content_id` over the decoded bytes.
 
@@ -165,7 +172,7 @@ A second thin entry over the same three B1 functions, for MCP hosts. It is not a
 
 **Rejected input spends nothing.** The config contract is checked once, before any host callback or evaluation, by the shared `cli._preflight`; each check reuses the kernel's own validator (`EnvelopeBuilder` id registry, `splits.load_splits`, `evaluator.Budget`'s cap rule, `loop._validate_runs`) rather than restating it, so the CLI and MCP reject the same configs. It rejects only values the kernel would reject much later, so accepted values keep their exact kernel semantics — `max_attempts: -1` still yields `no_improvement` and `1.0` still yields `selected`. The guarantee covers **rejected input only**: a runtime failure after execution has begun — a host error, a malformed evaluation row, a decision-backend failure — may already have consumed evaluator items while leaving the campaign state absent or unchanged.
 
-The SDK name changed in v2: `FastMCP` is now `MCPServer` ([migration guide](https://py.sdk.modelcontextprotocol.io/v2/migration/#fastmcp-renamed-to-mcpserver)). There is no approval-creation tool and no shell or filesystem tool, so MCP cannot mint an approval: `accept` reads a record the host or owner wrote and gives `not_updated` otherwise.
+The SDK name changed in v2: `FastMCP` is now `MCPServer` ([migration guide](https://py.sdk.modelcontextprotocol.io/v2/migration/#fastmcp-renamed-to-mcpserver)). There is no approval-creation tool and no shell or filesystem tool, so MCP cannot mint an approval: `accept` reads a record the host or owner wrote and gives `not_updated` if it does not match. The `accept` tool call waits for the owner's approval file exactly as the CLI does (steps 2–4 above), so it may block for as long as the owner takes. MCP allows a long-running request, but clients **SHOULD** set request timeouts and cancel on expiry ([MCP 2025-11-25 lifecycle §Timeouts](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#timeouts)); a host that cannot hold one call open that long should run `rsi-kernel accept` from the CLI instead.
 
 ```sh
 pip install 'rsi-kernel[mcp]'

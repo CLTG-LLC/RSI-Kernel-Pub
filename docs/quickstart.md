@@ -32,7 +32,7 @@ lines of stdlib `http.server`) is the shortest example.
 
 ```json
 {
-  "campaign_id": "quickstart", "host_url": "http://127.0.0.1:<port>", "store": "<dir>/store",
+  "campaign_id": "quickstart", "host_url": "http://127.0.0.1:<port>", "store": "store",
   "component_ids": ["c1"], "evaluator_hash": "e", "code_hash": "k",
   "splits": {"splits": [
     {"name": "dev", "purpose": "dev", "selection_eligible": true, "item_ids": ["d0", "d1"]},
@@ -49,16 +49,30 @@ split (`src/rsi_kernel/splits.py`); `item_ids` must be disjoint across splits.
 rsi-kernel status       --config campaign.json   # -> {"campaign": null, ...} before any run
 rsi-kernel run-campaign --config campaign.json   # -> {"outcome": "selected", ...}
 rsi-kernel status       --config campaign.json   # now carries "approval_request"
-rsi-kernel accept       --config campaign.json --approval approval.json
+rsi-kernel accept       --config campaign.json --approval approval.json &   # files the request, then waits
+until [ -f store/approval-request.json ]; do sleep 1; done
+python -c 'import json, os; r = json.load(open("store/approval-request.json")); f = open("approval.json.tmp", "w"); json.dump({**{k: r[k] for k in ("candidate_hash", "evaluator_hash", "data_hash", "code_hash")}, "approver": "owner"}, f); f.close(); os.replace("approval.json.tmp", "approval.json")'   # the owner's step
+wait                                             # accept continues -> {"outcome": "updated", ...}
 ```
 
-Same shell as above: with the venv active, `rsi-kernel` is on `PATH`.
+Same shell as above: with the venv active, `rsi-kernel` and `python` are on
+`PATH`. `store` is relative to the working directory.
 
-**Order matters.** `accept` decides the campaign on its first call: with no
-approval file it records `not_updated` and closes the campaign, so a later call
-raises `CampaignClosed`. Write `approval.json` from `status.approval_request`
-*before* calling `accept`, carrying its `candidate_hash`, `evaluator_hash`,
-`data_hash` and `code_hash` plus an `approver`.
+**Order: request, approval, then accept continues** (#60). `accept` adjudicates,
+writes the `ApprovalRequest` to `store/approval-request.json` (the same hashes
+`status.approval_request` reports) and waits, polling once a second with no
+timeout, until the approval file exists. The owner writes `approval.json` from
+that request — its `candidate_hash`, `evaluator_hash`, `data_hash` and
+`code_hash` plus an `approver` — and `accept` continues: matching hashes give
+`updated`, a malformed or mismatched file gives `not_updated`. Without
+`--approval` it waits for `store/approval.json`. Publish the file atomically, a
+sibling temp file then
+[`os.replace`](https://docs.python.org/3/library/os.html#os.replace): `accept`
+reads it as soon as the name appears, so a half-written file gives `not_updated`.
+The campaign is closed when
+adjudication runs, before the wait: stopping `accept` during the wait leaves it
+closed with no outcome, and a later `accept` raises `CampaignClosed`, so write
+the approval rather than restarting.
 
 **Approvals are written by the host or owner and kept out of agent reach.** The
 kernel only reads the record: matching hashes prove it is internally consistent,
@@ -71,7 +85,7 @@ operational duty on the host.
 | `uv venv --seed --python 3.13` | 0.02 s real; seeds `pip` 26.3 |
 | `pip install <wheel>`, core | 1.02 s real; 0 runtime dependencies |
 | `pip list` after core install | 2 packages (`pip`, `rsi-kernel`) |
-| `rsi-kernel status` / `run-campaign` / `accept` | 0.06–0.10 s / 0.05–0.52 s / 0.05–0.09 s real |
+| `rsi-kernel status` / `run-campaign` / `accept` | 0.06–0.10 s / 0.05–0.52 s / 0.05–0.09 s real (`accept` measured before #60; it now also includes the owner's approval time) |
 
 The first `run-campaign` includes cache warm-up. It returned `{"outcome":
 "selected", "stop_reason": "attempts", "attempts": 1, "evaluator_items_used": 4}`
@@ -94,7 +108,7 @@ error codes, the `content_id` hash over decoded component bytes, and the
 loopback/no-redirect rules — are [`examples/java-host/`](../examples/java-host/)
 and [design §4.1](design.md#41-frozen-host-contract-for-non-python-hosts-issue-52);
 the bridge callable is [`http_evaluator.py`](../examples/java-host/http_evaluator.py).
-Measured: `run-campaign` 0.10 s, `accept` 0.06 s, `/count` 4 items after the
+Measured: `run-campaign` 0.10 s, `accept` 0.06 s (before #60, excluding the owner's approval time), `/count` 4 items after the
 campaign and 8 after acceptance (the adjudication split), `/applied` holding the
 approved hash. Apply is record-only; the champion bytes are not swapped.
 
