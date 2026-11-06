@@ -5,6 +5,9 @@ The frozen pre-registration is untouched; this file records the change under the
 "Transparent Changes" rule for preregistration amendments
 (https://www.cos.io/initiatives/prereg). Forward-only: it governs this campaign only.
 
+Amended 2026-11-06, before any S4b solve existed, under the same COS
+"Transparent Changes" rule (https://www.cos.io/initiatives/prereg).
+
 Scope convention: only what changes is stated here. Everything else — groups, the
 dev / adjudication / holdout carve, schedule, arms, metric, retention rule,
 estimator, isolation, the skill artifact and the trimmed final phase — is
@@ -89,10 +92,32 @@ hash-bound owner approval, which binds `code_hash` in the approval record as of
 - New run directory: **`pilot-004`** for the skill artifact. `pilot-001` (S4),
   `pilot-002` (S5) and `pilot-003` (S5b) are separate records and are not reused or
   edited.
-- Code pinned to the first `main` commit that contains this addendum. The run tree is
-  a clean detached checkout of that commit; its git SHA and both identity hashes are
-  recorded in the run's code-identity log **before the first solve**, as in
-  `docs/prereg-s5b-addendum.md` §3, and reported with the results.
+- Code pinned to the first `main` commit that contains this amendment, superseding the
+  earlier pin to the commit that first added this addendum. The run tree is a clean
+  detached checkout of it; its git SHA and both identity hashes go in the run's
+  code-identity log **before the first solve** (`docs/prereg-s5b-addendum.md` §3).
+- What the pin changes. Grading, selection, retention and approval-matching criteria
+  are unchanged — `loop.py`, `analysis.py` and `gdpevo/scoring.py` are byte-identical
+  between `6f04c52` and the new pin. Changed on the S4b path: #57 (PR #62) the proposer
+  model call retries transient errors — connection errors, 408/409/429/>=500, 2
+  retries — exactly as the openai-python SDK does by default, trigger S5b group 003
+  lost to one upstream HTTP 502 (report pending); #60 (PR #64) the approval request is
+  published atomically (temp file + `os.replace`), schema/wait/matching unchanged;
+  #49 (PR #55) the candidate is validated before staging and the solver, final phase
+  included, not after — valid ones score the same. `code_hash` and `evaluator_hash`
+  differ since both include adapter source bytes; #59 is T3-only; CLI/MCP/plugin are
+  not called by the pilot.
+- Retry accounting: the 42-call cap counts **logical** calls; a proposer call may make
+  its initial request plus up to two retries, logged as `retry` rows but not metered
+  again, so "failed calls included" (`docs/prereg-gdpevo-pilot.md` lines 79–89) is per
+  logical call and failed attempts' tokens may be unknown — 42 is not an HTTP bound.
+- Pre-run STOP, in this order: (a) freeze identity and reconcile the S5b exposure
+  (§4); (b) run the lead-only live smoke `tests/adapters/test_gdpevo_solver_live.py`
+  once at the pinned commit, using the approved group-001 champion on
+  `task_group_001/train/001`, with `RSI_LIVE_GDPEVO=1`, outside CI — one executed,
+  passing test; a skip does not count; (c) record its actual exposure, including any
+  operational failure; then (d) the first campaign solve. S5b did not run this fresh,
+  per its report.
 - Two hashes, one formula (`gdpevo.pilot._code_hash`): the **full code hash**
   (`_code_hash()`) and the **kernel-only hash** (`_code_hash(exclude=("adapters",))`),
   both recomputed on the run tree. Both are expected to differ from the S4 values
@@ -131,6 +156,11 @@ not assumed for any S5b line above.
 What S4b adds, on the same already-exposed screens: at most 9 champion dev solves
 plus 9 candidate dev solves per attempt per group (≤ 36 solver attempts per group),
 and — only if a group selects a candidate — the 42 final solves.
+
+The pre-run live smoke in §3 is its own row: one dev solve of
+`task_group_001/train/001`. Record the single smoke solver attempt and its outcome
+separately from campaign attempts, outside the campaign caps. Record any
+model-request retries separately; they are not additional solver attempts.
 
 The adjudication and holdout splits of groups 001 and 003 were each read once
 already, in the S4 final, and S5b may read them again before this campaign starts, as
