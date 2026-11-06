@@ -4,8 +4,10 @@ import base64
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -108,7 +110,7 @@ def firewall_classes(tmp_path_factory):
 def firewall_host(firewall_classes, tmp_path):
     processes = []
 
-    def make(champion=CHAMPION, cases=CASES, guards=GUARDS, **overrides):
+    def make(champion=CHAMPION, cases=CASES, guards=GUARDS, start=True, **overrides):
         work = tmp_path / str(len(processes))
         work.mkdir()
         champion_path = work / "champion.yml"
@@ -121,8 +123,13 @@ def firewall_host(firewall_classes, tmp_path):
                   "cases_path": cases_path, "guard_cases_path": guard_path, "evidence_path": str(log)}
         config.update(overrides)
         properties = work / "host.properties"
-        properties.write_text("".join(f"{key}={value}\n" for key, value in config.items()), encoding="utf-8")
-        proc, url = _start(["java", "-cp", str(firewall_classes), "FirewallHost", str(properties), "0"])
+        # java.util.Properties consumes backslashes before the JSON argv parser.
+        properties.write_text("".join(f"{key}={str(value).replace(chr(92), chr(92) * 2)}\n"
+                                      for key, value in config.items()), encoding="utf-8")
+        command = ["java", "-cp", str(firewall_classes), "FirewallHost", str(properties), "0"]
+        if not start:
+            return command
+        proc, url = _start(command)
         processes.append(proc)
         return url, log, champion_path
 
@@ -258,3 +265,206 @@ def test_routes_enforce_exact_path_and_method(firewall_host):
     assert _request(url, "/apply")[0] == 405
     assert _request(url, "/artifact/extra")[0] == 404
     assert len(_log_rows(log)) == 1
+
+
+@pytest.fixture
+def guard_setup(tmp_path):
+    offline = tmp_path / "synthetic offline copy"
+    offline.mkdir()
+    resource = offline / "rules.yml"
+    resource.write_bytes(CHAMPION)
+    counter = offline / "runs"
+    seen = offline / "seen.bytes"
+    script = offline / 'guard "quoted".py'
+    script.write_text(
+        "import os, pathlib, subprocess, sys, time\n"
+        "assert pathlib.Path.cwd() == pathlib.Path(sys.argv[1])\n"
+        "counter = pathlib.Path('runs')\n"
+        "counter.write_text(str(int(counter.read_text()) + 1) if counter.exists() else '1')\n"
+        "data = pathlib.Path('rules.yml').read_bytes()\n"
+        "pathlib.Path('seen.bytes').write_bytes(data)\n"
+        "print('synthetic-private-guard-output', flush=True)\n"
+        "print('synthetic-private-guard-error', file=sys.stderr, flush=True)\n"
+        "if b'synthetic-child-timeout' in data:\n"
+        "    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "    pathlib.Path('guard.pids').write_text(str(os.getpid()) + ' ' + str(child.pid))\n"
+        "    time.sleep(60)\n"
+        "if b'synthetic-timeout' in data: time.sleep(60)\n"
+        "if b'synthetic-delete' in data: pathlib.Path('rules.yml').unlink()\n"
+        "sys.exit(1 if b'synthetic-reject' in data else 0)\n", encoding="utf-8",
+    )
+    config = {"guard_command": json.dumps([sys.executable, str(script), str(offline)]),
+              "guard_working_directory": str(offline), "guard_resource_path": str(resource),
+              "guard_timeout_seconds": READY_TIMEOUT}
+    return config, resource, counter, seen
+
+
+@pytest.mark.parametrize("data,code,guard_status", [
+    (VALID + b" ", 200, "passed"),
+    (VALID + b"|synthetic-reject", 422, "guard_failed"),
+])
+def test_guard_command_exact_bytes_restoration_and_cache(firewall_host, guard_setup,
+                                                       data, code, guard_status):
+    config, resource, counter, seen = guard_setup
+    url, log, champion_path = firewall_host(**config)
+    for ids in (("d0",), ("d1",)):
+        status, reply = _request(url, "/evaluate", _candidate_body(data, ids))
+        assert resource.read_bytes() == champion_path.read_bytes() == CHAMPION
+        assert status == code
+        if code == 422:
+            assert reply == {"error": "ineligible", "reason_class": "guard_failed"}
+        else:
+            assert reply["results"][0]["item_id"] == ids[0]
+        row = _log_rows(log)[-1]
+        assert "guard_status" in row, "guard command result is missing from evidence"
+        assert row["guard_status"] == guard_status
+        assert row["skipped_tests"] == "unknown"
+        assert row["reason_class"] == ("none" if code == 200 else "guard_failed")
+        assert "synthetic-private" not in log.read_text() + json.dumps(reply)
+        assert seen.read_bytes() == data
+        assert counter.read_text() == "1"
+    # A distinct content ID needs its own guard result, even in the same host.
+    assert _request(url, "/evaluate", _candidate_body(VALID + b"|synthetic-next"))[0] == 200
+    assert counter.read_text() == "2"
+    assert resource.read_bytes() == CHAMPION
+
+
+@pytest.mark.parametrize("failure", ["launch", "timeout"])
+def test_guard_command_unavailable_is_operational_and_restored(firewall_host, guard_setup, failure):
+    config, resource, counter, _ = guard_setup
+    data = VALID
+    if failure == "launch":
+        config = {**config, "guard_command": json.dumps([str(resource.parent / "missing")])}
+    else:
+        # 0.5s is the existing bounded-startup test's timeout precedent.
+        config = {**config, "guard_timeout_seconds": 0.5}
+        data += b"|synthetic-timeout"
+    url, log, champion_path = firewall_host(**config)
+    started = time.monotonic()
+    for _ in range(2):
+        status, reply = _request(url, "/evaluate", _candidate_body(data))
+        assert resource.read_bytes() == champion_path.read_bytes() == CHAMPION
+        assert status == 500
+        assert reply == {"error": "operational", "reason_class": "guard_unavailable"}
+        assert _log_rows(log)[-1]["guard_status"] == "guard_unavailable"
+        assert "synthetic-private" not in log.read_text() + json.dumps(reply)
+    assert time.monotonic() - started < READY_TIMEOUT
+    if failure == "timeout":
+        assert counter.read_text() == "1"
+    else:
+        assert not counter.exists()
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_guard_command_timeout_terminates_descendants_before_response(firewall_host, guard_setup):
+    config, resource, _, _ = guard_setup
+    config = {**config, "guard_timeout_seconds": 0.5}
+    url, log, _ = firewall_host(**config)
+    pids_path = resource.parent / "guard.pids"
+    try:
+        status, reply = _request(url, "/evaluate", _candidate_body(VALID + b"|synthetic-child-timeout"))
+        assert status == 500 and reply["reason_class"] == "guard_unavailable"
+        assert pids_path.exists(), "guard did not record its owned parent and child PIDs"
+        pids = [int(value) for value in pids_path.read_text().split()]
+        assert len(pids) == 2
+        assert not any(_pid_alive(pid) for pid in pids), "guard descendants survived the timeout response"
+        assert resource.read_bytes() == CHAMPION
+        assert _log_rows(log)[-1]["guard_status"] == "guard_unavailable"
+    finally:
+        # Only the PIDs created and recorded by this synthetic guard are ours.
+        if pids_path.exists():
+            for pid in [int(value) for value in pids_path.read_text().split()]:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
+def test_guard_command_restores_deleted_resource_before_response(firewall_host, guard_setup):
+    config, resource, _, seen = guard_setup
+    original = resource.stat()
+    url, log, _ = firewall_host(**config)
+    data = VALID + b"|synthetic-delete"
+    status, reply = _request(url, "/evaluate", _candidate_body(data))
+    assert resource.exists(), "guard deletion prevented restoration of the champion"
+    assert resource.read_bytes() == CHAMPION
+    restored = resource.stat()
+    assert restored.st_mode == original.st_mode
+    assert restored.st_mtime_ns == original.st_mtime_ns
+    assert status == 200 and "results" in reply
+    assert seen.read_bytes() == data
+    assert _log_rows(log)[-1]["guard_status"] == "passed"
+
+
+def test_guard_command_incremental_build_sees_candidate_not_stale_champion(firewall_host, guard_setup):
+    # Timestamp-based build tools (GNU Make, incremental resource copies) rebuild
+    # only when the source is newer than the built copy; candidate install must
+    # therefore carry a fresh mtime, while restoration keeps the original one.
+    config, resource, _, _ = guard_setup
+    offline = resource.parent
+    built = offline / "built.yml"
+    script = offline / "incremental.py"
+    script.write_text(
+        "import pathlib, shutil, sys\n"
+        "src, out = pathlib.Path('rules.yml'), pathlib.Path('built.yml')\n"
+        "if not out.exists() or src.stat().st_mtime_ns > out.stat().st_mtime_ns:\n"
+        "    shutil.copyfile(src, out)\n"
+        "sys.exit(1 if b'synthetic-reject' in out.read_bytes() else 0)\n", encoding="utf-8")
+    past = resource.stat().st_mtime - 100
+    os.utime(resource, (past, past))
+    built.write_bytes(CHAMPION)  # prebuilt, newer than the source
+    original = resource.stat()
+    config = {**config, "guard_command": json.dumps([sys.executable, str(script)])}
+    url, log, _ = firewall_host(**config)
+    status, reply = _request(url, "/evaluate", _candidate_body(VALID + b"|synthetic-reject"))
+    assert status == 422, "incremental guard built stale champion bytes"
+    assert reply == {"error": "ineligible", "reason_class": "guard_failed"}
+    assert resource.read_bytes() == CHAMPION
+    assert resource.stat().st_mtime_ns == original.st_mtime_ns
+
+
+@pytest.mark.parametrize("change", ["missing_timeout", "zero_timeout", "negative_timeout",
+                                    "nan_timeout", "infinite_timeout", "shell_string",
+                                    "empty_argv", "blank_executable", "missing_workdir",
+                                    "missing_resource", "outside_resource"])
+def test_guard_command_invalid_config_fails_before_listening(firewall_host, guard_setup, tmp_path, change):
+    config, resource, _, _ = guard_setup
+    if change == "missing_timeout":
+        config = {key: value for key, value in config.items() if key != "guard_timeout_seconds"}
+    elif change in ("zero_timeout", "negative_timeout", "nan_timeout", "infinite_timeout"):
+        config = {**config, "guard_timeout_seconds": {
+            "zero_timeout": 0, "negative_timeout": -1, "nan_timeout": "NaN",
+            "infinite_timeout": "Infinity"}[change]}
+    elif change in ("shell_string", "empty_argv", "blank_executable"):
+        config = {**config, "guard_command": {"shell_string": "python guard.py",
+                  "empty_argv": "[]", "blank_executable": '[""]'}[change]}
+    elif change == "outside_resource":
+        outside = tmp_path / "outside.yml"
+        outside.write_bytes(CHAMPION)
+        config = {**config, "guard_resource_path": str(outside)}
+    else:
+        key = "guard_working_directory" if change == "missing_workdir" else "guard_resource_path"
+        config = {name: value for name, value in config.items() if name != key}
+    command = firewall_host(start=False, **config)
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        try:
+            stdout, _ = proc.communicate(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            pytest.fail("invalid guard configuration started the server")
+        assert proc.returncode != 0
+        assert "LISTENING" not in stdout
+        assert resource.read_bytes() == CHAMPION
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=READY_TIMEOUT)
+        proc.stdout.close()
+        proc.stderr.close()

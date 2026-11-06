@@ -17,7 +17,15 @@ import java.net.URLClassLoader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributeView;
+import java.nio.file.attribute.FileTime;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
@@ -35,8 +43,14 @@ public final class FirewallHost {
     private final byte[] champion;
     private final String componentName;
     private final List<String> applied = new ArrayList<>();
+    private final List<String> guardCommand;
+    private final Path guardDirectory;
+    private final Path guardResource;
+    private final long guardTimeoutNanos;
+    private final Map<String, String> guardResults = new java.util.HashMap<>();
 
     private record Case(String text, boolean mustMatch) { }
+    private static final class GuardUnavailable extends Exception { }
     private static final class Ineligible extends Exception {
         final String reason;
         Ineligible(String reason) { this.reason = reason; }
@@ -61,6 +75,32 @@ public final class FirewallHost {
         if (componentName.isBlank()) throw new IllegalArgumentException("empty component name");
         cases = readCases(path("cases_path"));
         guards = readCases(path("guard_cases_path"));
+        if (config.containsKey("guard_command")) {
+            Object command = new Json("{\"argv\":" + required("guard_command") + "}").object().get("argv");
+            if (!(command instanceof List<?> argv) || argv.isEmpty()
+                    || string(argv.get(0)).isBlank()
+                    || argv.stream().anyMatch(value -> string(value).indexOf('\0') >= 0)) {
+                throw new IllegalArgumentException("guard_command must be a nonempty argv list");
+            }
+            guardCommand = argv.stream().map(FirewallHost::string).toList();
+            guardDirectory = path("guard_working_directory").toRealPath();
+            guardResource = path("guard_resource_path").toRealPath();
+            if (!Files.isDirectory(guardDirectory) || !Files.isRegularFile(guardResource)
+                    || !guardResource.startsWith(guardDirectory)) {
+                throw new IllegalArgumentException("guard resource must be inside the offline working directory");
+            }
+            double seconds = Double.parseDouble(required("guard_timeout_seconds"));
+            double nanos = seconds * TimeUnit.SECONDS.toNanos(1);
+            if (!Double.isFinite(nanos) || nanos < 1 || nanos >= Long.MAX_VALUE) {
+                throw new IllegalArgumentException("guard_timeout_seconds must be positive and representable");
+            }
+            guardTimeoutNanos = (long) nanos;
+        } else {
+            guardCommand = List.of();
+            guardDirectory = null;
+            guardResource = null;
+            guardTimeoutNanos = 0;
+        }
     }
 
     public static void main(String[] args) throws Exception {
@@ -138,6 +178,7 @@ public final class FirewallHost {
         String contentId = "";
         String status = "operational";
         String reason = "IllegalArgumentException";
+        String guardStatus = "not_run";
         int code = 400;
         String body;
         try {
@@ -158,6 +199,11 @@ public final class FirewallHost {
             }
             List<String> items = items(req.get("item_ids"));
             code = 500; // From here failures are operational, except the explicit eligibility stages.
+            if (!guardCommand.isEmpty()) {
+                guardStatus = guard(contentId, components.get(componentName));
+                if (guardStatus.equals("guard_failed")) throw new Ineligible("guard_failed");
+                if (guardStatus.equals("guard_unavailable")) throw new GuardUnavailable();
+            }
             List<Predicate<String>> predicates = load(components.get(componentName));
             for (Case guard : guards.values()) {
                 if (!correct(predicates, guard)) throw new Ineligible("GoldenGuardFailure");
@@ -171,12 +217,16 @@ public final class FirewallHost {
             status = "ineligible";
             reason = e.reason;
             body = error(status, reason);
+        } catch (GuardUnavailable e) {
+            guardStatus = "guard_unavailable";
+            reason = "guard_unavailable";
+            body = error(status, reason);
         } catch (Exception e) {
             reason = reasonClass(e);
             body = error(status, reason);
         }
         try {
-            evidence(contentId, status, reason);
+            evidence(contentId, status, reason, guardStatus);
         } catch (IOException e) {
             // No successful response without durable evidence. A broken evidence
             // destination cannot itself receive a JSONL line; repair it before rerun.
@@ -184,6 +234,91 @@ public final class FirewallHost {
             body = error("operational", "EvidenceWriteFailure");
         }
         send(ex, code, body);
+    }
+
+    private String guard(String id, byte[] candidate) {
+        String cached = guardResults.get(id);
+        if (cached != null) return cached;
+        String result;
+        try {
+            // Preserve champion bytes and source metadata before the guard can
+            // delete or alter the destination. Restoration never reads it again.
+            Path restore = replacementFile(guardResource, champion, true);
+            try {
+                atomicReplace(guardResource, candidate);
+                result = runGuard();
+            } finally {
+                try {
+                    Files.move(restore, guardResource, StandardCopyOption.ATOMIC_MOVE,
+                            StandardCopyOption.REPLACE_EXISTING);
+                } finally {
+                    Files.deleteIfExists(restore);
+                }
+            }
+        } catch (IOException e) {
+            result = "guard_unavailable";
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            result = "guard_unavailable";
+        }
+        guardResults.put(id, result);
+        return result;
+    }
+
+    private String runGuard() throws IOException, InterruptedException {
+        Process process = new ProcessBuilder(guardCommand).directory(guardDirectory.toFile())
+                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                .redirectError(ProcessBuilder.Redirect.DISCARD).start();
+        try {
+            process.getOutputStream().close();
+            if (!process.waitFor(guardTimeoutNanos, TimeUnit.NANOSECONDS)) return "guard_unavailable";
+            return process.exitValue() == 0 ? "passed" : "guard_failed";
+        } finally {
+            if (process.isAlive()) {
+                // Capture the tree while the root still owns its descendants.
+                List<ProcessHandle> owned = new ArrayList<>(process.descendants().toList());
+                owned.add(process.toHandle());
+                owned.forEach(ProcessHandle::destroyForcibly);
+                try {
+                    CompletableFuture.allOf(owned.stream().map(ProcessHandle::onExit)
+                            .toArray(CompletableFuture<?>[]::new))
+                            .get(guardTimeoutNanos, TimeUnit.NANOSECONDS);
+                } catch (ExecutionException | TimeoutException e) {
+                    throw new IOException("guard termination unavailable", e);
+                }
+            }
+        }
+    }
+
+    // Restoration keeps the original timestamps; candidate installation keeps the fresh
+    // write time so timestamp-based build tools (e.g. GNU Make, incremental resource
+    // copies) rebuild from the candidate rather than a stale champion copy.
+    private static Path replacementFile(Path resource, byte[] bytes, boolean preserveTimes) throws IOException {
+        BasicFileAttributes attributes = Files.readAttributes(resource, BasicFileAttributes.class);
+        Path temp = Files.createTempFile(resource.getParent(), ".guard-", ".tmp");
+        try {
+            Files.copy(resource, temp, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
+            Files.write(temp, bytes);
+            if (preserveTimes) {
+                Files.getFileAttributeView(temp, BasicFileAttributeView.class).setTimes(
+                        attributes.lastModifiedTime(), attributes.lastAccessTime(), attributes.creationTime());
+            } else {
+                Files.setLastModifiedTime(temp, FileTime.fromMillis(System.currentTimeMillis()));
+            }
+            return temp;
+        } catch (IOException | RuntimeException e) {
+            Files.deleteIfExists(temp);
+            throw e;
+        }
+    }
+
+    private static void atomicReplace(Path resource, byte[] bytes) throws IOException {
+        Path temp = replacementFile(resource, bytes, false);
+        try {
+            Files.move(temp, resource, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } finally {
+            Files.deleteIfExists(temp);
+        }
     }
 
     private static Map<String, Object> request(HttpExchange ex) throws IOException {
@@ -255,9 +390,11 @@ public final class FirewallHost {
         return "{\"results\":[" + String.join(",", rows) + "]}";
     }
 
-    private void evidence(String id, String status, String reason) throws IOException {
+    private void evidence(String id, String status, String reason, String guardStatus) throws IOException {
+        String guardFields = guardCommand.isEmpty() ? "" : ",\"guard_status\":" + quote(guardStatus)
+                + ",\"skipped_tests\":\"unknown\"";
         String line = "{\"content_id\":" + quote(id) + ",\"status\":" + quote(status)
-                + ",\"reason_class\":" + quote(reason) + "}\n";
+                + ",\"reason_class\":" + quote(reason) + guardFields + "}\n";
         Files.writeString(path("evidence_path"), line, StandardCharsets.UTF_8,
                 StandardOpenOption.CREATE, StandardOpenOption.APPEND);
     }

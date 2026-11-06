@@ -68,6 +68,61 @@ synthetic smoke, not evidence that a real golden gate ran. Guard text and
 exception messages never appear in responses or evidence. Split ownership stays
 with the kernel; the host does not select or carve splits.
 
+## Optional repository-test command
+
+Following the [SWE-bench evaluation harness](https://www.swebench.com/SWE-bench/guides/evaluation/),
+the host can run an offline repository's existing tests on the patched tree.
+Configure all four keys together:
+
+```properties
+guard_command=["./run-existing-tests", "--offline"]
+guard_working_directory=offline-copy
+guard_resource_path=offline-copy/resources/rules.yml
+guard_timeout_seconds=<explicit-positive-seconds>
+```
+
+`guard_command` is a **JSON argv array**, not a shell command string; it must
+contain an executable and may contain arguments. The JDK's
+[`ProcessBuilder`](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/ProcessBuilder.html)
+runs it directly, without adding a shell. Executable paths are interpreted by
+process-launch rules, not relative to the properties file; use an absolute
+executable or `./...` relative to the guard working directory. Properties-file
+escaping still applies: double any JSON backslashes. Both configured filesystem
+paths resolve relative to the properties file. The resource must be an existing
+regular file inside the working directory, including after resolving symlinks.
+Use only a disposable offline copy; never configure a live checkout.
+
+`guard_timeout_seconds` is required, with **no default**. It accepts finite positive
+seconds (including fractions) representable as JDK nanoseconds. Missing keys,
+invalid argv, invalid paths, or an invalid timeout prevent startup.
+
+For each distinct, verified candidate content ID, the host atomically replaces
+the resource with the **exact candidate bytes** using a same-directory temporary
+file and atomic rename, then runs the command in the configured directory.
+Exit `0` passes; any non-zero exit returns **422 `guard_failed`**. Launch failures,
+timeouts, or resource IO failures return **500 `guard_unavailable`**. On timeout,
+the host captures the command's descendants, forcibly stops them and the root,
+and waits for their exit before restoration, using the configured timeout again
+as the termination-wait bound. A failed termination wait is operational, not a
+pass. The descendant snapshot follows the JDK's
+[`ProcessHandle`](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/ProcessHandle.html)
+API; it is not isolation against a hostile process that spawns after the snapshot.
+Before installing the candidate, the host preserves the champion bytes and
+original resource metadata in a same-directory temporary file. A `finally` block
+atomically restores that preserved file before the response, even if the guard
+deletes or modifies the destination. Unrecoverable filesystem errors return
+`500 guard_unavailable`. Guard results, including failures,
+are cached by content ID for this host process; scoring still uses each call's
+requested items. Restart the host after changing the command or offline tree.
+
+Standard output and error are discarded and never echoed into responses or
+evidence. With a command configured, each evidence record also includes
+`guard_status` (`passed`, `guard_failed`, `guard_unavailable`, or `not_run` for
+invalid requests) and `skipped_tests: "unknown"`: discarded output cannot provide
+a trustworthy skipped-test count. Without a command configured, evaluation and
+evidence retain their existing behavior. The command guard supplements rather
+than replaces the native loader and golden-case checks.
+
 ## HTTP and evidence
 
 | Route | Reply |
@@ -83,9 +138,11 @@ shape or unknown item returns `400`; wrong methods return `405`, path suffixes
 `404`. Unlike the old synthetic evaluator seam, bytes are always required.
 
 * **422 ineligible**: `IllegalStateException` thrown by the loader, a loader regex
-  compilation failure, or a guard failure (`GoldenGuardFailure`).
+  compilation failure, a golden-case failure (`GoldenGuardFailure`), or a
+  configured test command's non-zero exit (`guard_failed`).
 * **500 operational**: factory/reflection/IO failures and predicate execution
-  faults, even an `IllegalStateException` outside the loader invocation.
+  faults, even an `IllegalStateException` outside the loader invocation; an
+  unavailable or timed-out test command returns `guard_unavailable`.
 * Errors contain only `{error, reason_class}`, never exception messages or text.
 
 Each evaluation call appends one JSONL record:
@@ -110,7 +167,8 @@ tie; this host does not change that rule or add a score threshold.
 
 This is the trusted local-example boundary already documented in design §4.1:
 unbounded bodies, a fixed-shape JSON parser, serial evaluation, no authentication,
-no regex isolation or execution deadline. Do not expose it as a shared service
+no regex isolation or loader/predicate execution deadline (the optional command
+has its own required timeout). Do not expose it as a shared service
 or run arbitrary candidates. The synthetic fixture only tests tiny regexes.
 
 ## Verify
@@ -123,6 +181,8 @@ CI=true uv sync --locked -q && CI=true uv run pytest -q
 Use JDK 21 on `PATH`. Missing `javac` skips locally but fails in CI, mirroring
 `test_java_host.py`. Tests compile a synthetic package-private loader, exercise
 exact-byte reflection, scores, guard rejection through the unchanged CLI,
-operational failures, identity-bound evidence, and record-only apply. Real
+operational failures, identity-bound evidence, record-only apply, and a synthetic
+repository-test command's exact bytes, restoration, cache, timeout, launch failure,
+configuration validation, and output suppression. Real
 built-copy reproduction is local only, outside CI and outside this repository;
 never import real golden, sealed, evaluation or PII fixtures into public tests.
