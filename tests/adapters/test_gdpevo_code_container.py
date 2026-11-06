@@ -147,9 +147,11 @@ Path("/work/answer.json").write_text(json.dumps({"synthetic":True}))
 print("synthetic trusted agent ok")' "$@"
 '''.replace("HOST_UID", str(os.getuid())).replace("HOST_GID", str(os.getgid())))
         fake_codex.chmod(0o755)
+        solver = object.__new__(CodeDockerSolver)
+        solver.limits = LIMITS
         try:
             result = subprocess.run(["docker", "run", "--name", name, "--network", "none",
-                *LIMITS.docker_argv(), *sd._bind(work, "/work", False),
+                *solver._solver_options(root), *sd._bind(work, "/work", False),
                 *sd._bind(fake_codex, "/usr/local/bin/codex"), synthetic_image,
                 "bash", "-c", SOLVER_COMMAND, "run-one", prompt],
                 capture_output=True, text=True, timeout=120)

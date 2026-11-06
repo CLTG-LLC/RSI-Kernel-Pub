@@ -132,11 +132,15 @@ def test_nonroot_limits_fixed_code_mapping_and_trusted_codex(code_solver):
         user = argv[argv.index("--user") + 1]
         assert user == f"{os.getuid()}:{os.getgid()}"
         assert int(user.split(":")[0]) != 0
-        for flag, value in (("--cpus", "1"),
-                            ("--memory", str(LIMITS.memory_bytes)),
-                            ("--ulimit", f"fsize={LIMITS.file_bytes}:{LIMITS.file_bytes}")):
-            assert argv[argv.index(flag) + 1] == value
+        assert argv[argv.index("--cap-drop") + 1] == "ALL"
+        assert argv[argv.index("--security-opt") + 1] == "no-new-privileges"
         assert "--pids-limit" not in argv and "--privileged" not in argv
+    for flag, value in (("--cpus", str(LIMITS.cpus)),
+                        ("--memory", str(LIMITS.memory_bytes)),
+                        ("--memory-swap", str(LIMITS.memory_bytes)),
+                        ("--ulimit", f"fsize={LIMITS.file_bytes}:{LIMITS.file_bytes}")):
+        assert logic[logic.index(flag) + 1] == value
+        assert flag not in agent
     assert logic[logic.index("--network") + 1] == "none"
     assert agent[agent.index("--network") + 1].endswith("-net")
     assert "--read-only" in logic and "--tmpfs" in logic

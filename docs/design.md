@@ -235,8 +235,11 @@ rsi-kernel-mcp          # then connect any MCP client over stdio
   This keeps private bind-mounted outputs host-readable on native Linux Docker
   (issue #59; [Docker run User](https://docs.docker.com/engine/containers/run/#user)).
   `/work` retains its private `0700` staging mode; cross-user chmods are unnecessary.
-  Explicit CPU/memory/file-size limits, dropped capabilities and no-new-privileges
-  remain unchanged.
+  Explicit CPU, memory and file-size limits bind the untrusted candidate-code
+  container only. Both containers remain non-root, with dropped capabilities and
+  no-new-privileges; the trusted agent has no CPU, memory or file-size limits
+  imposed by `CodeLimits`. See `docs/prereg-e1c-amendment-1.md` for the post-smoke,
+  pre-campaign operational amendment; the frozen resource values are unchanged.
   Candidate code has a read-only filesystem with disposable `/tmp`, no writable
   host mounts, and `--network none`: it needs no service calls to transform stdin
   into a prompt. Only the trusted agent joins the existing internal task/model

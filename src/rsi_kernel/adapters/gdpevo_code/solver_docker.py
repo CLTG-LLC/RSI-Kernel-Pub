@@ -48,10 +48,20 @@ class CodeLimits:
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError("memory/file bytes must be positive integers")
 
-    def docker_argv(self):
+    @staticmethod
+    def _host_ids():
         uid, gid = os.getuid(), os.getgid()
         if uid == 0:
             raise sd._Stop("root_host_uid")
+        return uid, gid
+
+    def agent_argv(self):
+        uid, gid = self._host_ids()
+        return ["--user", f"{uid}:{gid}", "--cap-drop", "ALL",
+                "--security-opt", "no-new-privileges"]
+
+    def docker_argv(self):
+        uid, gid = self._host_ids()
         return ["--user", f"{uid}:{gid}", "--cpus", str(self.cpus),
                 "--memory", str(self.memory_bytes), "--memory-swap", str(self.memory_bytes),
                 "--ulimit", f"fsize={self.file_bytes}:{self.file_bytes}",
@@ -108,7 +118,7 @@ class CodeDockerSolver(sd.DockerSolver):
             raise ValueError("code stage hash mismatch")
 
     def _solver_options(self, out):
-        return self.limits.docker_argv()
+        return self.limits.agent_argv()
 
     def _collect_logic(self, argv, output):
         """Drain both PIPEs with bounded writes, never communicate()'s unbounded buffer.
