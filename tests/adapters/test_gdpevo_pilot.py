@@ -932,6 +932,28 @@ def test_report_lists_no_candidate_group_without_pairing_it(tree):
     assert all(r["paired_groups"] == ["task_group_001", "task_group_003"] for r in rows)
 
 
+def test_report_lists_operationally_stopped_group_without_pairing_it(tree):
+    """Issue #72: a campaign that stopped operationally has no ``selected`` key at all.
+
+    The group is reported as stopped and unpaired, never as a no-candidate group and
+    never fed to the paired estimator.
+    """
+    fakes = Fakes()
+    for group in pilot.GROUPS:
+        optimise(tree, fakes, group)
+    # pilot-003/task_group_003 state: the campaign never closed, so the closed record
+    # (outcome, stop_reason, selected) was never written.
+    (tree[1] / "task_group_003/campaign.json").write_text(json.dumps({"status": "open"}))
+    for group in pilot.GROUPS:
+        if group != "task_group_003":
+            final(tree, fakes, group)
+    rows = pilot.report(tree[1], tree[0], "updated")
+    assert [r["split"] for r in rows] == ["dev", "adjudication", "holdout"]
+    assert all(r["stopped_groups"] == ["task_group_003"] for r in rows)
+    assert all(r["no_candidate_groups"] == [] for r in rows)
+    assert all(r["paired_groups"] == ["task_group_001", "task_group_002"] for r in rows)
+
+
 def test_null_rebind_record_is_malformed_not_absent(tree, tmp_path):
     """PR #37 re-check: a present rebind.json holding JSON null still STOPs."""
     fakes = Fakes()

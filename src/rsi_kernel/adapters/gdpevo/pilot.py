@@ -648,7 +648,7 @@ def _dev_rows(group_dir: Path) -> list[dict]:
     campaign results, and the campaign already wrote them to the public store.
     """
     state = json.loads((group_dir / "campaign.json").read_text())
-    selected = None if state["selected"] is None else state["selected"]["id"]
+    selected = None if state.get("selected") is None else state["selected"]["id"]
     results = [json.loads(line) for line in (group_dir / "public/results.jsonl").read_text().splitlines()]
     rows = []
     for row in results:
@@ -667,23 +667,43 @@ def _run_spread(rows) -> float | None:
     return sum(spreads) / len(spreads) if spreads else None
 
 
+def _report_groups(run_dir: Path) -> tuple[list[str], list[str], list[str]]:
+    """(paired, no_candidate, stopped) groups, each from its own campaign record.
+
+    A group whose campaign stopped operationally never wrote the closed record, so
+    its campaign.json holds only ``{"status": "open"}``: no ``selected`` key (and no
+    ``stop_reason`` to read) — pilot-003/task_group_003, issue #72. That is a STOP,
+    not a no-candidate group, and it is not a source of report rows.
+    """
+    paired, no_candidate, stopped = [], [], []
+    for group in GROUPS:
+        state = json.loads((run_dir / group / "campaign.json").read_text())
+        if "selected" not in state:
+            stopped.append(group)
+        elif state["selected"]:
+            paired.append(group)
+        else:
+            no_candidate.append(group)
+    return paired, no_candidate, stopped
+
+
 def report(run_dir: Path, root: Path, outcome: str) -> list[dict]:
     """Report inputs (S4 addendum, #36): dev from the optimise archive, then adjudication
     and holdout; noise is the champion's run-to-run spread on dev, not a control arm."""
     from ...analysis import report_table
     run_dir, root = Path(run_dir), Path(root)
-    dev = [row for group in GROUPS for row in _dev_rows(run_dir / group)]
     # Paired tables cover only groups with a selected candidate; a no-candidate group
     # has no pairs and is reported as such, never as fabricated candidate rows.
-    paired = [g for g in GROUPS if json.loads((run_dir / g / "campaign.json").read_text())["selected"]]
-    unpaired = [g for g in GROUPS if g not in paired]
+    paired, unpaired, stopped = _report_groups(run_dir)
+    dev = [row for group in [*paired, *unpaired] for row in _dev_rows(run_dir / group)]
     noise = _run_spread([r for r in dev if r["arm"] == "champion"])
     if len(paired) < 2:
         # The paired group bootstrap needs at least two groups (SciPy rejects samples
         # of fewer than two); say so instead of substituting another estimator.
         return [{"split": split, "outcome": outcome, "comparison": "unavailable",
                  "reason": "fewer than two groups with a selected candidate",
-                 "champion_run_spread": noise, "paired_groups": paired, "no_candidate_groups": unpaired}
+                 "champion_run_spread": noise, "paired_groups": paired, "no_candidate_groups": unpaired,
+                 "stopped_groups": stopped}
                 for split in ("dev", "adjudication", "holdout")]
     dev = [r for r in dev if r["group"] in paired]
     final = [json.loads(line) for group in paired
@@ -704,7 +724,8 @@ def report(run_dir: Path, root: Path, outcome: str) -> list[dict]:
                            "champion": arm(source, "champion", group_of),
                            "candidate": arm(source, "candidate", group_of)}
     entropy = json.loads((run_dir / "entropy.json").read_text())["entropy"]
-    return [{**row, "champion_run_spread": noise, "paired_groups": paired, "no_candidate_groups": unpaired}
+    return [{**row, "champion_run_spread": noise, "paired_groups": paired, "no_candidate_groups": unpaired,
+             "stopped_groups": stopped}
             for row in report_table(tables, list(range(RUNS)), entropy)]
 
 
