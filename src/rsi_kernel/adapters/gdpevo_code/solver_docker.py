@@ -49,7 +49,10 @@ class CodeLimits:
                 raise ValueError("memory/file bytes must be positive integers")
 
     def docker_argv(self):
-        return ["--user", "nobody", "--cpus", str(self.cpus),
+        uid, gid = os.getuid(), os.getgid()
+        if uid == 0:
+            raise sd._Stop("root_host_uid")
+        return ["--user", f"{uid}:{gid}", "--cpus", str(self.cpus),
                 "--memory", str(self.memory_bytes), "--memory-swap", str(self.memory_bytes),
                 "--ulimit", f"fsize={self.file_bytes}:{self.file_bytes}",
                 "--cap-drop", "ALL", "--security-opt", "no-new-privileges"]
@@ -83,6 +86,7 @@ class CodeDockerSolver(sd.DockerSolver):
             "limits": asdict(limits), "timeout": self.timeout}, sort_keys=True)
 
     def _stage(self, candidate, task, input_dir, out, scope):
+        self.limits.docker_argv()  # Refuse root before staging's external commands.
         text = validate_code(candidate, self.champion)
         code = out / "harness"
         _safe(code / COMPONENT)
@@ -93,10 +97,7 @@ class CodeDockerSolver(sd.DockerSolver):
         (code / "prompt.txt").write_bytes((out / "prompt.txt").read_bytes())
         (code / "prompt.txt").chmod(0o444)
         sd._json(out / "code-manifest.json", sd._manifest(code))
-        # A private per-attempt host stage; nobody needs writable /work for Codex.
-        work.chmod(0o777)
-        for path in work.rglob("*"):
-            path.chmod(0o755 if path.is_dir() else 0o444)
+        # Same-UID containers need no cross-user chmods; /work stays private.
         return trusted, work, group, task_path
 
     def _check_stage(self, out, work):

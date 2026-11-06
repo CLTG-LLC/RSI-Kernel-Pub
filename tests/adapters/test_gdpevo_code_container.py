@@ -31,7 +31,8 @@ def synthetic_image():
 
 SCRIPT = '''import json,os,resource,socket,sys
 from pathlib import Path
-assert os.getuid()!=0
+assert os.getuid()==HOST_UID and os.getuid()!=0
+assert os.getgid()==HOST_GID
 assert resource.getrlimit(resource.RLIMIT_FSIZE)==(FILE_BYTES,FILE_BYTES)
 assert not Path('/trusted/eval').exists() and not Path('/trusted/output').exists()
 assert not Path('/tmp/gdpevo-codex-home').exists()
@@ -49,7 +50,7 @@ for host in ('task-env','model-fwd'):
     except OSError: pass
     else: raise AssertionError('candidate reached '+host)
 print(json.dumps({'prompt':sys.stdin.read().strip()+' VALUE'}))
-'''.replace("FILE_BYTES", str(LIMITS.file_bytes))
+'''.replace("FILE_BYTES", str(LIMITS.file_bytes)).replace("HOST_UID", str(os.getuid())).replace("HOST_GID", str(os.getgid()))
 
 
 def test_real_nonroot_reference_change_and_network_boundary(synthetic_image):
@@ -124,18 +125,18 @@ def test_real_nonroot_reference_change_and_network_boundary(synthetic_image):
 
 
 @pytest.mark.parametrize("prompt", ["--help", "--config=x", "resume"])
-def test_real_trusted_command_runs_as_nobody_without_candidate_code(synthetic_image, prompt):
+def test_real_trusted_command_runs_as_host_uid_without_candidate_code(synthetic_image, prompt):
     name = "t3-agent-" + uuid.uuid4().hex
     with tempfile.TemporaryDirectory(prefix="t3-agent-", dir=Path(__file__).parent) as temporary:
         root = Path(temporary)
         work = root / "work"
-        work.mkdir(mode=0o777)
-        work.chmod(0o777)
+        work.mkdir(mode=0o700)
         fake_codex = root / "codex"
         fake_codex.write_text('''#!/bin/sh
 if [ "$1" = "--version" ]; then echo "codex-cli 0.166.0"; exit; fi
 exec python3 -c 'import os,json,sys;from pathlib import Path
-assert os.getuid()!=0
+assert os.getuid()==HOST_UID and os.getuid()!=0
+assert os.getgid()==HOST_GID
 assert sys.argv[-3:-1]==["--json","--"]
 assert sys.argv[-1] in ("--help","--config=x","resume")
 assert not Path("/harness/solver.py").exists()
@@ -144,7 +145,7 @@ assert "http://model-fwd:8080/v1" in config.read_text()
 assert "requires_openai_auth = false" in config.read_text()
 Path("/work/answer.json").write_text(json.dumps({"synthetic":True}))
 print("synthetic trusted agent ok")' "$@"
-''')
+'''.replace("HOST_UID", str(os.getuid())).replace("HOST_GID", str(os.getgid())))
         fake_codex.chmod(0o755)
         try:
             result = subprocess.run(["docker", "run", "--name", name, "--network", "none",
@@ -154,7 +155,11 @@ print("synthetic trusted agent ok")' "$@"
                 capture_output=True, text=True, timeout=120)
             assert result.returncode == 0, result.stderr
             assert result.stdout == "codex-cli 0.166.0\nsynthetic trusted agent ok\n"
-            assert json.loads((work / "answer.json").read_text()) == {"synthetic": True}
+            answer = work / "answer.json"
+            assert answer.stat().st_uid == os.getuid() != 0
+            assert answer.stat().st_gid == os.getgid()
+            assert answer.stat().st_mode & 0o777 == 0o600
+            assert json.loads(answer.read_text()) == {"synthetic": True}
         finally:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True)
 

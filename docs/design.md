@@ -192,7 +192,7 @@ rsi-kernel-mcp          # then connect any MCP client over stdio
 |---|---|---|---|
 | T1 | prompts/context bundle, memory entries, skills, tool descriptions | proposer container, no protected mounts | first: **one** adapter (prompt/context), second only after a measured result |
 | T2 | tool routing among approved tools | same | next |
-| T3 | harness code | sandbox only, each control from its own source: container per task and hidden tests excluded from the creator (OpenSkill 2606.06741 README); `--network none` (Docker docs, none driver); allowlist env + per-run prefix (Harness² 742d48f/f1417de, inverted); CPU/memory/file limits as user nobody (RSI-Anything candidate sandbox). Never in the kernel. | after T1 E0 is green |
+| T3 | harness code | sandbox only, each control from its own source: container per task and hidden tests excluded from the creator (OpenSkill 2606.06741 README); `--network none` (Docker docs, none driver); allowlist env + per-run prefix (Harness² 742d48f/f1417de, inverted); CPU/memory/file limits as the non-root invoking uid:gid (Docker run User; issue #59). Never in the kernel. | after T1 E0 is green |
 
 ### T3 harness-code contract (issue #49)
 
@@ -222,8 +222,14 @@ rsi-kernel-mcp          # then connect any MCP client over stdio
   extra keys, path traversal and symlinked staging paths are rejected before
   execution. Both content identity and the parent's exact singleton tuple are
   checked against the frozen champion; an unchanged root champion has no parent.
-- **Isolation:** both candidate-code and trusted-agent containers use `nobody`,
-  explicit CPU/memory/file-size limits, dropped capabilities and no-new-privileges.
+- **Isolation:** both candidate-code and trusted-agent containers use the invoking
+  host process's numeric `uid:gid` (`os.getuid()` / `os.getgid()`); a root host UID
+  causes `STOP root_host_uid` before staging commands, never a root fallback.
+  This keeps private bind-mounted outputs host-readable on native Linux Docker
+  (issue #59; [Docker run User](https://docs.docker.com/engine/containers/run/#user)).
+  `/work` retains its private `0700` staging mode; cross-user chmods are unnecessary.
+  Explicit CPU/memory/file-size limits, dropped capabilities and no-new-privileges
+  remain unchanged.
   Candidate code has a read-only filesystem with disposable `/tmp`, no writable
   host mounts, and `--network none`: it needs no service calls to transform stdin
   into a prompt. Only the trusted agent joins the existing internal task/model

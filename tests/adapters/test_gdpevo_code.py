@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -128,7 +129,10 @@ def test_nonroot_limits_fixed_code_mapping_and_trusted_codex(code_solver):
     logic = next(a for a, _ in fake.calls if "harness-code" in a)
     agent = next(a for a, _ in fake.calls if a[:2] == ["docker", "create"])
     for argv in (logic, agent):
-        for flag, value in (("--user", "nobody"), ("--cpus", "1"),
+        user = argv[argv.index("--user") + 1]
+        assert user == f"{os.getuid()}:{os.getgid()}"
+        assert int(user.split(":")[0]) != 0
+        for flag, value in (("--cpus", "1"),
                             ("--memory", str(LIMITS.memory_bytes)),
                             ("--ulimit", f"fsize={LIMITS.file_bytes}:{LIMITS.file_bytes}")):
             assert argv[argv.index(flag) + 1] == value
@@ -151,6 +155,39 @@ def test_nonroot_limits_fixed_code_mapping_and_trusted_codex(code_solver):
     connections = [a for a, _ in fake.calls if a[:3] == ["docker", "network", "connect"]]
     assert len(connections) == 1 and connections[0][-1].endswith("-fwd")
     assert not any("/trusted/eval" in a or "/trusted/output" in a for a in logic + agent)
+
+
+def test_root_host_refused_before_external_commands(code_solver, monkeypatch):
+    from rsi_kernel.adapters.gdpevo import solver_docker as sd
+    monkeypatch.setattr(os, "getuid", lambda: 0)
+    reason = None
+    try:
+        LIMITS.docker_argv()
+    except sd._Stop as error:
+        reason = error.reason
+    assert reason == "root_host_uid"
+    assert solve(code_solver)["failure"] == {"status": "STOP", "reason": "root_host_uid"}
+    assert not code_solver[1].calls
+
+
+def test_private_stage_permissions_preserved(code_solver, monkeypatch):
+    solver, fake, incoming, _, _ = code_solver
+    from rsi_kernel.adapters.gdpevo import solver_docker as sd
+    original = sd.DockerSolver._stage
+    modes = {}
+    def stage(self, *args):
+        result = original(self, *args)
+        work = result[1]
+        modes.update({path: path.stat().st_mode for path in (work, *work.rglob("*"))})
+        return result
+    monkeypatch.setattr(sd.DockerSolver, "_stage", stage)
+    out = solver.evidence_dir / "stage-only"
+    out.mkdir(parents=True)
+    solver._stage(champion(), next(iter(solver.tasks.values())), incoming, out, "stage-only")
+    assert modes and all(path.stat().st_mode == mode for path, mode in modes.items())
+    assert (out / "work").stat().st_mode & 0o777 == 0o700
+    assert (out / "harness/solver.py").stat().st_mode & 0o777 == 0o444
+    assert not fake.attach_started
 
 
 @pytest.mark.parametrize("payload", [{"prompt": ""}, {"prompt": "x", "score": 1},
