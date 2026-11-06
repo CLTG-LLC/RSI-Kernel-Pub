@@ -1,14 +1,14 @@
 # Plug-and-play exit evidence at one frozen commit
 
-Issue #68. Every measurement below is at `main` commit `af2054c` (detached checkout, no local changes). Measured 2026-11-06 on an Apple-silicon Mac, macOS 26.6 (Darwin 25.6.0), `uv 0.13.4` (Homebrew), CPython 3.13.16 (uv-managed), OpenJDK 21.0.13 (Homebrew `openjdk@21`). There are no pass thresholds; each criterion is reported as observed. Evidence paths are relative to the run's `exit-evidence/` directory. Wall times are `/usr/bin/time -p` `real` seconds from single runs.
+Issue #68. Every measurement below is at `main` commit `af2054c` (detached checkout, no local changes). Measured 2026-11-06 on an Apple-silicon Mac, macOS 26.6 (Darwin 25.6.0), `uv 0.13.4` (Homebrew), CPython 3.13.16 (uv-managed), OpenJDK 21.0.13 (Homebrew `openjdk@21`). There are no pass thresholds; each criterion is reported as observed. Evidence paths are relative to the run's `exit-evidence/` directory. Wall times are `/usr/bin/time -p` `real` seconds from single runs. Sections 3 and 4 cite campaign results measured at those runs' own pinned commits, each stated in the cited report.
 
 Three claims are kept separate throughout:
 
 | Claim | Status in this report |
 |---|---|
 | Capability demonstrated (the kernel runs a campaign and an approval-gated accept through the plug-in surfaces) | criteria 1, 2, 5, 6, 7 below |
-| Continuation demonstrated (the same kernel bytes close campaigns on further tiers) | pending, criterion 3 |
-| Retained second update demonstrated (a ratchet from an approved champion, parent → child) | pending, criterion 4 |
+| Continuation demonstrated (the same kernel bytes close campaigns on further tiers) | "continuation tested" in S4b (`docs/results/s4b-continuation.md`), which is a factual status, not a demonstrated claim; the cross-tier claim stays pending, criterion 3 |
+| Retained second update demonstrated (a ratchet from an approved champion, parent → child) | not demonstrated (S4b: no second retained update), §4 |
 
 ## 1. Wheel in a clean venv, campaign plus accept from the console entry, no checkout present
 
@@ -71,11 +71,25 @@ The mismatched approval is rejected as `not_updated` with exit code 0. Stdout co
 
 ## 3. Same kernel bytes close campaigns on skill, memory and harness-code tiers
 
-Pending (S5b/E1c runs). Context and tool routing tiers: untested.
+Pending (E1c running). Context and tool routing tiers: untested.
+
+- Skill tier: S4 closed `updated` for `task_group_001` and `task_group_003` on the owner's hash-bound approval, and `no_improvement` for `task_group_002` (`docs/results/gdpevo-pilot.md`).
+- Memory tier: S5b closed `updated` for `task_group_001`, `no_improvement` for `task_group_002`, and an operational STOP for `task_group_003` (`docs/results/e1a-s5b-evaluate-first.md`).
 
 ## 4. One ratchet from an approved champion
 
-Pending (S4b run).
+Measured by S4b (`docs/results/s4b-continuation.md`, issue #48) at that run's pinned commit `16ac7fe7d110623ae7a990d6e96a235aca516c97`, under the frozen pre-registration `docs/prereg-gdpevo-pilot.md` as amended by `docs/prereg-s4b-addendum.md`. S4b ran one campaign per paired group from that group's approved S4 champion, loaded through the existing hash-checked loader; `task_group_002` has no approved champion (S4 closed it `no_improvement`) and is excluded.
+
+| Observation | Value |
+|---|---|
+| Starting champion, `task_group_001` | approved S4 candidate `3ef20ac564f77e7276361ac1305b3dbded320e6df258326f4102d59d3bc1688c`; champion-file sha256 `bea09d29f38484f2616a98a8de631e5b1e18530ddfa54500f868041955c80be3` |
+| Starting champion, `task_group_003` | approved S4 candidate `96f5e060365012822c6914bdddfdd7b45922d41b6e49c85d16408ecb5e2dfc10`; champion-file sha256 `1d1065e73893ffbc5a0b99e572ff6f03cab7040cfdaf43b1f5e22b0f130258c0` |
+| Lineage parent → child | every selected candidate's `parent_ids` equals that group's champion id (in `campaign.json` `selected` and in every `public/candidates.jsonl` row), so the chain parent → child is recorded |
+| Pre-registered status | **continuation tested** (a factual status, not an outcome) |
+| Terminal outcome, both groups | **no second retained update** (`failed_gate`: adjudication retention not met, −0.027778 in each group); no approval request written |
+| Approval and `apply(hash)` | none: no approval was requested, so nothing was approved or applied |
+
+Criterion 4 has two halves, reported separately: the campaign started from an approved champion with the lineage recorded, and no second update was retained. The dev selection was a tie in `task_group_001` (paired dev delta 0.000000) and +0.013072 in `task_group_003`; the holdout split moved +0.016604 overall (report-only, not a gate) and did not change the outcome. Keeping the champion is not counted as success.
 
 ## 5. E0 denial tests and T3 checks green
 
@@ -153,6 +167,7 @@ Steps 1–4 sum to 4.94 s.
 
 ## Not covered
 
-- Criteria 3 and 4 (pending runs).
+- Criterion 3 (pending the E1c run); the memory and skill tiers are cited from their merged reports in that section.
+- Criterion 4 does not demonstrate a retained second update: S4b recorded the lineage and ended `failed_gate` in both groups, so no second approval, `apply(hash)` or champion change exists from it.
 - Toy keyword task on loopback only; says nothing about evaluation quality or real hosts.
 - Single runs; no repeat timings.
