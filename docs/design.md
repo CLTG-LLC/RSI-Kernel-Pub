@@ -172,6 +172,63 @@ The Java example is a trusted local example, not a hardened service for arbitrar
 | T2 | tool routing among approved tools | same | next |
 | T3 | harness code | sandbox only, each control from its own source: container per task and hidden tests excluded from the creator (OpenSkill 2606.06741 README); `--network none` (Docker docs, none driver); allowlist env + per-run prefix (Harness² 742d48f/f1417de, inverted); CPU/memory/file limits as user nobody (RSI-Anything candidate sandbox). Never in the kernel. | after T1 E0 is green |
 
+### T3 harness-code contract (issue #49)
+
+- **Editable:** exactly one UTF-8 `solver.py`, replaced as a whole file, never a
+  diff. **NAMED LOCAL REPRESENTATION SOLVER-PROMPT-SCRIPT:** the trusted
+  `SOLVER_COMMAND` dispatch invokes `python3 /harness/solver.py` in a separate
+  per-task container. stdin is the trusted task prompt (UTF-8); stdout must be
+  exactly one JSON object `{"prompt": "non-empty Codex task prompt"}`. stderr is
+  diagnostic only. The script may read `/work/input`, `/work/skill` and
+  `/work/environment_access.md`; it cannot supply runtime options or scores.
+  The host validates that object and passes only its string after the `--`
+  option terminator in the code tier's trusted Codex invocation. The shared S4
+  command stays unchanged. Positional prompt precedent:
+  [Codex 0.166.0 cli.rs:81–85](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/exec/src/cli.rs#L81-L85).
+  This is solver prompt logic, not arbitrary replacement
+  of the provider/agent runner. Full-file rewrite precedent:
+  [OpenEvolve configuration.md:74](https://github.com/algorithmicsuperintelligence/openevolve/blob/0fa8c4de9faff5d11e2f819557c6b14e0add3a23/docs/configuration.md#L74).
+- **Trusted:** command dispatch and Codex invocation, frozen SKILL.md, model,
+  provider/runtime config, images, input staging, official grading, metering,
+  and timeout. Candidate code runs before, and in a different container from,
+  Codex configuration and sessions: it cannot forge the trusted session meter.
+  No candidate directory, score file or grader/evaluator/gold is mounted in the
+  Codex container. The external grader still uses `--network none`.
+- **Mapping:** only `{"solver.py": <source>}` with `text/plain` is admitted;
+  text/plain remains a byte transport, not executable permission in the kernel.
+  The code adapter alone stages it to the fixed `/harness/solver.py`. Other keys,
+  extra keys, path traversal and symlinked staging paths are rejected before
+  execution. Both content identity and the parent's exact singleton tuple are
+  checked against the frozen champion; an unchanged root champion has no parent.
+- **Isolation:** both candidate-code and trusted-agent containers use `nobody`,
+  explicit CPU/memory/file-size limits, dropped capabilities and no-new-privileges.
+  Candidate code has a read-only filesystem with disposable `/tmp`, no writable
+  host mounts, and `--network none`: it needs no service calls to transform stdin
+  into a prompt. Only the trusted agent joins the existing internal task/model
+  forwarder network, so candidate Python cannot bypass Codex metering.
+  The code tier's trusted PIPE collector bounds stdout and stderr independently
+  to the existing frozen `file_bytes` allowance (RLIMIT_FSIZE alone cannot bound
+  pipes). Overflow kills, verifies stopped, and removes the owned container;
+  sizes are checked again before text decoding/JSON parsing. The data-only
+  Docker runner and shared command retain their existing behaviour.
+  Docker controls follow [Docker run resource, user, ulimit and security options](https://docs.docker.com/reference/cli/docker/container/run/).
+  **NAMED LOCAL EXCEPTION T3-RESOURCE-VALUES:** `cpus`, `memory_bytes` and
+  `file_bytes` are required frozen parameters, with no defaults. Any supplied
+  values remain local exceptions pending workload feasibility measurement;
+  **NAMED LOCAL EXCEPTION T3-SYNTHETIC-VALUES:** the tiny-container checks use
+  1 CPU, 268435456 memory bytes and 1048576 file bytes. Successful execution
+  validates only this synthetic fixture, not GDPevo capacity. Limits, fixed
+  SKILL.md identity and timeout are included in the frozen execution identity,
+  checked again before final evaluation. No PID limit
+  is added: [SWE-bench container creation:103–125](https://github.com/SWE-bench/SWE-bench/blob/02e7a74ffd0b707aab73d203fe87bdc7c76afc8e/swebench/harness/run_evaluation.py#L103-L125)
+  establishes no such workload values. On timeout kill, verify stopped, then
+  remove only that owned container; retain evidence and other scoped resources.
+- **Driver:** `gdpevo_code` reuses S4 `Hooks`, paired dev retention, record-only
+  apply and the existing isolated proposer. No live run is authorized by these
+  synthetic implementation tests. Checks: exact-key/path/symlink and parent
+  denial, non-root/resource flags, trusted-score authority, scoped timeout
+  removal, synthetic reference/change grading, and unchanged data-only adapters.
+
 ## 7. Build slices (one GitHub issue per slice)
 
 1. **S0+S1, together.** Contracts, plus wrapping GEPA's EvalServer/BudgetTracker pieces with:

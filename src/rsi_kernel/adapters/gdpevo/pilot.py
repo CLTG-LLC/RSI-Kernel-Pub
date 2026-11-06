@@ -120,8 +120,12 @@ def _code_hash(package: Path | None = None, lock: Path | None = None, exclude: t
     return hashlib.sha256(json.dumps([*files, ("uv.lock", _sha(lock))]).encode()).hexdigest()
 
 
-def _identity(champion: Candidate, tasks) -> dict:
-    return {"champion_id": champion.id, "evaluator_hash": _evaluator_hash(tasks), "code_hash": _code_hash()}
+def _identity(champion: Candidate, tasks, solver=None) -> dict:
+    code_hash = _code_hash()
+    execution = getattr(solver, "execution_identity", None)
+    if execution is not None:
+        code_hash = content_id({"code": code_hash, "execution": execution})
+    return {"champion_id": champion.id, "evaluator_hash": _evaluator_hash(tasks), "code_hash": code_hash}
 
 
 def _prerun(root, run_dir, groups, calibration_answer, calibration_replay) -> dict:
@@ -178,6 +182,8 @@ class Hooks:
     container: Callable[..., object]  # (text champion, records, splits, model) -> payload
     admit: Callable[..., Candidate | None]  # (champion, payload, decider, dev_results)
     spend_cap: int
+    # T3 alone supplies a sandboxed solver; data-only tiers keep DockerSolver.
+    solver_factory: Callable | None = None
 
 
 def _skill_container(champion, records, splits, model):
@@ -227,6 +233,7 @@ def _metered_solver(solver, calls):
             return result
         finally:
             calls.log("solver", _token_usage(result))
+    run.execution_identity = getattr(solver, "execution_identity", None)
     return run
 
 
@@ -286,7 +293,7 @@ def optimise_group(*, root: Path, run_dir: Path, group: str, champion: Mapping, 
     tasks = _prerun(root, run_dir, [group], calibration_answer, calibration_replay)[group]
     calls = _Calls(group_dir / "calls.jsonl")
     champion = hooks.load_champion(champion)
-    identity = _identity(champion, tasks)  # frozen before any solve; final rechecks it
+    identity = _identity(champion, tasks, solver)  # frozen before any solve; final rechecks it
     adapter = _adapter(root, group_dir, tasks, champion, _metered_solver(solver, calls), "stages",
                        adapter_class=hooks.adapter_class)
     _json(group_dir / "campaign.json", {"status": "open"})
@@ -411,7 +418,7 @@ def _rebind_record(run_dir: Path, group: str) -> dict | None:
 
 
 def rebind(*, root: Path, run_dir: Path, group: str, champion: Mapping, addendum: Path,
-           load_champion: Callable[[Mapping], Candidate] = _champion) -> dict:
+           load_champion: Callable[[Mapping], Candidate] = _champion, solver=None) -> dict:
     """Record a pre-measurement change of code/evaluator identity (S4 addendum, #36).
 
     ``from`` is the campaign's frozen identity, so it must equal campaign.json;
@@ -425,7 +432,7 @@ def rebind(*, root: Path, run_dir: Path, group: str, champion: Mapping, addendum
     if state.get("status") != "closed":
         raise PilotStop(f"campaign {group} is open or missing")
     frozen = {k: state.get(k) for k in ("champion_id", "evaluator_hash", "code_hash")}
-    current = _identity(load_champion(champion), frozen_tasks(root, group))
+    current = _identity(load_champion(champion), frozen_tasks(root, group), solver)
     if (group_dir / "rebind.json").exists():
         raise PilotStop(f"rebind already recorded for {group}")
     if current["champion_id"] != frozen["champion_id"]:
@@ -459,7 +466,7 @@ def final_phase(*, root: Path, run_dir: Path, group: str, champions: Mapping, so
     champion = hooks.load_champion(champions[group])
     tasks = frozen_tasks(root, group)
     rebind = _rebind_record(run_dir, group)
-    if not _identity_ok(frozen, _identity(champion, tasks), champion.id, rebind):
+    if not _identity_ok(frozen, _identity(champion, tasks, solver), champion.id, rebind):
         raise PilotStop(f"frozen identity drift in {group}")
     # Issue #42: approval binds the validated code identity (frozen, or the rebind's ``to``).
     code_hash = (rebind["to"] if rebind is not None else frozen)["code_hash"]
@@ -716,17 +723,22 @@ def main(argv=None, hooks=SKILL) -> int:
     # Config: root, run_dir, champions {group: {path, sha256}}, calibration_answer, jev_url.
     config = json.loads(args.config.read_text())
     root, run_dir = Path(config["root"]), Path(config["run_dir"])
+    make_solver = DockerSolver if hooks.solver_factory is None else (
+        lambda **kwargs: hooks.solver_factory(config, args.group, **kwargs))
     if args.phase == "rebind":
         if args.addendum is None:
             parser.error("rebind needs --addendum")
+        solver = None if hooks.solver_factory is None else make_solver(
+            root=root, tasks=frozen_tasks(root, args.group),
+            evidence_dir=run_dir / f"final/{args.group}/evidence", timeout=TIMEOUT, stage="acceptance")
         record = rebind(root=root, run_dir=run_dir, group=args.group, champion=config["champions"][args.group],
-                        addendum=args.addendum, load_champion=hooks.load_champion)
+                        addendum=args.addendum, load_champion=hooks.load_champion, solver=solver)
         print(json.dumps({"group": args.group, "addendum_sha256": record["addendum_sha256"]}))
         return 0
     if args.phase == "final":
         # Acceptance stage admits test tasks; one group per process (host cap 4).
         tasks = frozen_tasks(root, args.group)
-        solver = DockerSolver(root=root, tasks=tasks, evidence_dir=run_dir / f"final/{args.group}/evidence",
+        solver = make_solver(root=root, tasks=tasks, evidence_dir=run_dir / f"final/{args.group}/evidence",
                               timeout=TIMEOUT, stage="acceptance")
         result = final_phase(root=root, run_dir=run_dir, group=args.group, champions=config["champions"],
                              solver=solver, calibration_answer=Path(config["calibration_answer"]),
@@ -737,7 +749,7 @@ def main(argv=None, hooks=SKILL) -> int:
     tasks = frozen_tasks(root, args.group)
     dev = [t for t in tasks if t.subset == "train" and t.task_id in DEV_IDS]
     group_dir = run_dir / args.group
-    solver = DockerSolver(root=root, tasks=dev, evidence_dir=group_dir / "evidence", timeout=TIMEOUT)
+    solver = make_solver(root=root, tasks=dev, evidence_dir=group_dir / "evidence", timeout=TIMEOUT)
     # Adapter used only for proposer_runtime deny paths (source root, private store).
     adapter = _adapter(root, group_dir, tasks, hooks.load_champion(config["champions"][args.group]), solver,
                        "stages", adapter_class=hooks.adapter_class)

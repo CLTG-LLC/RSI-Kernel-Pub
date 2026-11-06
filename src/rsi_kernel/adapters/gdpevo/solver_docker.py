@@ -193,6 +193,10 @@ class DockerSolver:
     """
 
     upstream_commit = UPSTREAM_COMMIT
+    solver_command = SOLVER_COMMAND
+
+    def _solver_options(self, out):
+        return []
 
     def __init__(self, *, root: Path, tasks: Sequence[FrozenTask], evidence_dir: Path, timeout: float,
                  stage: str = "optimise"):
@@ -512,10 +516,10 @@ class DockerSolver:
     def _solve(self, out, scope, image):
         work = out / "work"
         self._run(["docker", "create", "--name", scope + "-agent", "--platform", PLATFORM,
-                   "--network", scope + "-net", *_bind(work, "/work", False),
+                   "--network", scope + "-net", *self._solver_options(out), *_bind(work, "/work", False),
                    *_bind(work / "input", "/work/input"), *_bind(work / "skill", "/work/skill"),
                    *_bind(work / "environment_access.md", "/work/environment_access.md"),
-                   image, "bash", "-c", SOLVER_COMMAND, "run-one", (out / "prompt.txt").read_text().rstrip("\n")], out / "agent-id.txt")
+                   image, "bash", "-c", self.solver_command, "run-one", (out / "prompt.txt").read_text().rstrip("\n")], out / "agent-id.txt")
         started = datetime.datetime.now(datetime.timezone.utc).isoformat()
         begin, attached = time.monotonic(), None
         try:

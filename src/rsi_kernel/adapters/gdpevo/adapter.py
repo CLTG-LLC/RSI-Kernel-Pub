@@ -81,10 +81,13 @@ def _result(item_id: str, score: float | None, reason: str | None = None) -> dic
 
 
 class GDPevoAdapter:
+    # Artifact tiers override validation; the data-only default remains exact SKILL.md.
+    _validate_candidate = staticmethod(validate_skill)
+
     def __init__(self, *, root: Path, champion: Candidate, tasks: Sequence[FrozenTask],
                  splits: Splits, solver: Solver, evaluator_timeout: float, work_dir: Path,
                  archive: Archive, solver_env: Mapping[str, str] | None = None):
-        validate_skill(champion)
+        self._validate_candidate(champion)
         if isinstance(evaluator_timeout, bool) or not math.isfinite(evaluator_timeout) or evaluator_timeout <= 0:
             raise ValueError("evaluator timeout must be a positive frozen config value")
         self.root, self.work_dir = Path(root).resolve(), Path(work_dir).resolve()
@@ -106,7 +109,7 @@ class GDPevoAdapter:
         self.archive, self._champion = archive, champion
 
     def get_artifact(self) -> Candidate:
-        validate_skill(self._champion)
+        self._validate_candidate(self._champion)
         return self._champion
 
     def apply(self, approved_candidate_hash: str) -> None:
@@ -121,7 +124,7 @@ class GDPevoAdapter:
         return GDPevoProposerRuntime(image, dev_data_dir, output_dir, deny_paths=(self.root, self.archive.private_dir))
 
     def evaluate(self, candidate: Candidate, item_ids: Sequence[str]) -> list[dict]:
-        validate_skill(candidate)
+        self._validate_candidate(candidate)
         if not item_ids or len(set(item_ids)) != len(item_ids):
             raise ValueError("item ids must be a non-empty unique sequence")
         if not set(item_ids) <= self.splits.dev_item_ids():
@@ -132,6 +135,7 @@ class GDPevoAdapter:
         return [self._evaluate_one(candidate, item, directory) for item, directory in zip(item_ids, directories)]
 
     def _evaluate_one(self, candidate: Candidate, item_id: str, directory: Path) -> dict:
+        self._validate_candidate(candidate)  # final-phase callers bypass evaluate()
         # A fresh stage contains only input files; solver never receives eval/gold.
         with tempfile.TemporaryDirectory(dir=self.work_dir, prefix="attempt-") as temporary:
             # pathlib.resolve canonicalizes macOS /var and /tmp parent aliases;
@@ -155,7 +159,7 @@ class GDPevoAdapter:
                                           or not math.isfinite(score) or not 0 <= score <= 1):
                     return _result(item_id, None, "solver_result")
                 _verify_task(self.root, self.tasks[item_id])
-                validate_skill(candidate)
+                self._validate_candidate(candidate)
                 result = _result(item_id, score)
                 if "failure" in solved:
                     result["failure"] = solved["failure"]
@@ -169,7 +173,7 @@ class GDPevoAdapter:
             except (OSError, ValueError):
                 return _result(item_id, None, "json")
             _verify_task(self.root, self.tasks[item_id])
-            validate_skill(candidate)
+            self._validate_candidate(candidate)
             return self._grade(item_id, directory, prediction)
 
     def _grade(self, item_id: str, directory: Path, prediction: Path) -> dict:
