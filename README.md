@@ -9,8 +9,10 @@ A host product plugs in through a thin adapter. Inside the loop:
 
 **Promotion is never decided by the loop.** A paired check on a sealed adjudication split, followed by human approval, decides it.
 
-Status: design stage. See `docs/design.md` and the open issues.
-See the [host integration guide](docs/host-guide.md).
+Status: research prototype. The S4 skill pilot accepted 2 of 3 groups; see
+[docs/results/](docs/results/). See `docs/design.md` and the open issues.
+See the [host integration guide](docs/host-guide.md) and the
+[adopter quickstart](docs/quickstart.md).
 
 ## Working in this repo
 
