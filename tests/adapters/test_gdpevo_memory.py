@@ -404,15 +404,20 @@ def test_final_phase_render_happens_once_per_evaluation(memory_host, monkeypatch
     assert len(renders) == 2
 
 
-def test_admit_draft_state_is_artifact_counts_only(memory, memory_host):
-    backend = ChoiceBackend("add")
+def test_admit_draft_reaches_evaluation_without_d4_veto(memory, memory_host):
+    backend, log = ChoiceBackend("discard"), io.StringIO()
+    champion = memory_host.get_artifact()
     rows = [{"score": 1.0}, {"score": 0.0}, {"score": None, "failure": {"reason": "solver"}}]
-    candidate = memory.admit_draft(memory_host.get_artifact(),
-                                   json.dumps(brief("Changed")), Decider(backend, io.StringIO()), rows)
-    assert memory.read_library(candidate) == {"e1": brief(), "e2": brief("Changed")}
-    request = backend.requests[0]
-    assert request["state"] == {"c1.dev_pass_count": 1, "c1.dev_fail_count": 2}
-    assert CANARY not in json.dumps(request)
+    entry = brief(f"Changed {CANARY}")
+    candidate = memory.admit_draft(champion, json.dumps(entry), Decider(backend, log), rows)
+    assert candidate is not None
+    assert memory.read_library(candidate) == {"e1": brief(), "e2": entry}
+    assert candidate.parent_ids == (champion.id,)
+    assert not backend.requests
+    assert log.getvalue() == ""
+    assert memory_host.evaluate(candidate, ["toy/train/001"])[0]["score"] == 1.0
+    assert memory_host.get_artifact() is champion
+    assert memory.read_library(champion) == {"e1": brief()}
 
 
 @pytest.mark.parametrize("extra", [{"choice": "add"}, {"id": "e9"}, {"entry_id": "e9"},
@@ -429,7 +434,30 @@ def test_container_draft_is_ignored_for_ids_and_operation(memory, memory_host):
     candidate = memory.admit_draft(memory_host.get_artifact(), json.dumps(brief("Changed")),
                                    Decider(backend, io.StringIO()), [{"score": 1.0}])
     assert set(memory.read_library(candidate)) == {"e1", "e2"}
-    assert list(backend.requests[0]["questions"]["D4"]["criteria"]) == ["add", "merge:e1", "revise:e1", "discard"]
+    assert not backend.requests
+
+
+@pytest.mark.parametrize("payload", ["{}", json.dumps({**brief(), "action": ""}),
+    json.dumps({**brief(), "pointers": "x"}),
+    '{"task_pattern":"x","task_pattern":"y","action":"a","completion_criteria":"c","pointers":[]}'])
+def test_invalid_draft_rejected_without_decision_or_evaluation(memory, memory_host, host, payload):
+    backend, log = ChoiceBackend("discard"), io.StringIO()
+    champion = memory_host.get_artifact()
+    with pytest.raises(ValueError, match="invalid entry JSON brief"):
+        memory.admit_draft(champion, payload, Decider(backend, log), [{"score": 1.0}])
+    assert not backend.requests and not host[4]
+    assert log.getvalue() == ""
+    assert memory_host.get_artifact() is champion
+
+
+def test_exact_duplicate_draft_skips_decision_and_evaluation(memory, memory_host, host):
+    backend, log = ChoiceBackend("add"), io.StringIO()
+    champion = memory_host.get_artifact()
+    assert memory.admit_draft(champion, json.dumps(brief()), Decider(backend, log),
+                              [{"score": 1.0}]) is None
+    assert not backend.requests and not host[4]
+    assert log.getvalue() == ""
+    assert memory_host.get_artifact() is champion
 
 
 def test_malformed_or_empty_draft_skips_d4(memory, memory_host):

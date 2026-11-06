@@ -737,29 +737,26 @@ def final_library(library_tree, fakes, group, wait=approve_matching):
                              calibration_replay=fakes.replay, wait=wait, hooks=memory_pilot.LIBRARY)
 
 
-def test_library_optimise_wiring_uses_one_proposer_d2_and_d4_per_attempt(library_tree):
+def test_library_optimise_wiring_uses_one_proposer_and_d2_per_attempt(library_tree):
     fakes = LibraryFakes()
     result = optimise_library(library_tree, fakes, "task_group_001")
     assert result.selected is not None
     calls = [json.loads(line) for line in
              (library_tree[0][1] / "task_group_001/calls.jsonl").read_text().splitlines()]
-    # 4 dev evaluations x 3 tasks x 3 runs = 36 solver, plus 3 proposer, 3 D2 and 3 D4.
+    # 4 dev evaluations x 3 tasks x 3 runs = 36 solver, plus 3 proposer and 3 D2.
     kinds = [call["kind"] for call in calls]
     assert kinds.count("solver") == 36
     assert kinds.count("proposer") == 3
-    assert kinds.count("jev") == 6
-    assert len(calls) == 45 == library_tree[2].SPEND_CAP
+    assert kinds.count("jev") == pilot.MAX_ATTEMPTS
+    assert len(calls) == 42 < library_tree[2].SPEND_CAP == 45
     decisions = [json.loads(line) for line in
                  (library_tree[0][1] / "task_group_001/decisions.jsonl").read_text().splitlines()]
-    # D2 opens each attempt and D4 follows inside that attempt's PROPOSE.
-    assert [next(iter(d["envelope"]["questions"])) for d in decisions] == ["D2", "D4"] * pilot.MAX_ATTEMPTS
-    d4 = [d for d in decisions if "D4" in d["envelope"]["questions"]]
-    assert all(d["baseline_answer"] == {"D4": "discard"} for d in d4)
-    for record in d4:
-        assert set(record["envelope"]["state"]) == {"c1.dev_pass_count", "c1.dev_fail_count"}
-    # The canary is in every admitted entry, so its absence from the log proves no entry text leaks.
+    assert [next(iter(d["envelope"]["questions"])) for d in decisions] == ["D2"] * pilot.MAX_ATTEMPTS
+    assert all(set(envelope["questions"]) == {"D2"} for envelope in fakes.jev_calls)
+    # The canary is in every admitted entry; neither D2 envelopes nor logs receive it.
     from rsi_kernel.adapters.gdpevo_memory import read_library
     assert MEMORY in json.dumps(read_library(result.selected))
+    assert MEMORY not in json.dumps(fakes.jev_calls)
     assert MEMORY not in (library_tree[0][1] / "task_group_001/decisions.jsonl").read_text()
     assert MEMORY not in (library_tree[0][1] / "task_group_001/calls.jsonl").read_text()
 
@@ -780,14 +777,26 @@ class DiscardFakes(LibraryFakes):
         return Jev()
 
 
-def test_library_all_discard_wiring_selects_nothing_and_reports_unavailable(library_tree):
-    """Addendum §9: every D4 discard is no candidate, no final solve, "unavailable"."""
-    run_dir, root = library_tree[0][1], library_tree[0][0]
+def test_library_discard_decider_cannot_veto_draft_evaluation(library_tree):
     fakes = DiscardFakes()
+    result = optimise_library(library_tree, fakes, "task_group_001")
+    assert result.selected is not None
+    assert result.outcome == "selected"
+    assert result.evaluator_items_used == (pilot.MAX_ATTEMPTS + 1) * len(pilot.DEV_IDS) * pilot.RUNS
+    assert len(fakes.solver_calls) == result.evaluator_items_used
+    assert len(fakes.jev_calls) == pilot.MAX_ATTEMPTS
+    assert all(set(envelope["questions"]) == {"D2"} for envelope in fakes.jev_calls)
+    assert MEMORY not in json.dumps(fakes.jev_calls)
+
+
+def test_library_empty_drafts_select_nothing_and_report_unavailable(library_tree):
+    """No draft still means no candidate, no final solve, and unavailable comparisons."""
+    run_dir, root = library_tree[0][1], library_tree[0][0]
+    fakes = LibraryFakes()
+    fakes.model = lambda prompt: ""
     results = {}
     for group in pilot.GROUPS:
         results[group] = optimise_library(library_tree, fakes, group)
-        # 3 attempts -> 3 D4 discards -> no candidate; only the champion's dev ran.
         assert json.loads((run_dir / group / "campaign.json").read_text())["selected"] is None
         outcomes = [json.loads(line) for line in
                     (run_dir / group / "outcomes.jsonl").read_text().splitlines()]
@@ -797,16 +806,12 @@ def test_library_all_discard_wiring_selects_nothing_and_reports_unavailable(libr
         assert results[group].evaluator_items_used == len(pilot.DEV_IDS) * pilot.RUNS == 9
         calls = [json.loads(line) for line in (run_dir / group / "calls.jsonl").read_text().splitlines()]
         kinds = [call["kind"] for call in calls]
-        # 9 champion dev solver + 3 proposer + 3 D2 + 3 D4 = 18 expected, well under the 45 cap.
-        assert (kinds.count("solver"), kinds.count("proposer"), kinds.count("jev")) == (9, 3, 6)
-        assert len(calls) == 18 < library_tree[2].SPEND_CAP
+        # Only champion dev, proposer and D2 calls; unused D4 slots remain headroom.
+        assert (kinds.count("solver"), kinds.count("proposer"), kinds.count("jev")) == (9, 3, 3)
+        assert len(calls) == 15 < library_tree[2].SPEND_CAP == 45
         decisions = [json.loads(line) for line in
                      (run_dir / group / "decisions.jsonl").read_text().splitlines()]
-        d4 = [d for d in decisions if "D4" in d["envelope"]["questions"]]
-        # Three real D4 records: Jev said discard, matching the recorded baseline, no fallback.
-        assert len(d4) == 3 == pilot.MAX_ATTEMPTS
-        assert [d["answer"] for d in d4] == [{"D4": "discard"}] * 3
-        assert all(d["baseline_answer"] == {"D4": "discard"} for d in d4)
+        assert [next(iter(d["envelope"]["questions"])) for d in decisions] == ["D2"] * pilot.MAX_ATTEMPTS
         assert not any("fallback_reason" in d for d in decisions)
     # No candidate anywhere: the final phase solves nothing and is not an update.
     fakes.solver_calls.clear()

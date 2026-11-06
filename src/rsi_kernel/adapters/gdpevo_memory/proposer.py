@@ -1,11 +1,8 @@
-"""Admission inside PROPOSE (design §2), reusing standalone GDPevo/GEPA.
+"""Draft admission inside PROPOSE, reusing standalone GDPevo/GEPA.
 
-Only the injected proposer sees entry text. D4 receives the unchanged kernel's
-fixed envelope with ids and numeric dev state; fallback is Decider-owned discard.
-
-The proposer container has no credentials (prereg "Isolation"), so it only drafts
-text. D4 runs on the host: ``admit_draft`` validates the draft and builds the
-envelope from host-owned ids, never from container-supplied fields (#35).
+The pilot's host validates and exact-deduplicates drafts into isolated candidates
+without a D4 veto; paired dev evaluation decides selection (#45). The in-process
+``propose`` helper retains its content-free D4 envelope for compatibility.
 """
 
 from typing import Callable, Mapping, Sequence
@@ -52,12 +49,10 @@ def _admit(champion: Candidate, drafted: str | None, decider: Decider, envelope:
 
 def admit_draft(champion: Candidate, drafted: str | None, decider: Decider,
                 dev_results: Sequence[Mapping]) -> Candidate | None:
-    """Host side of PROPOSE: D4 state from the champion dev results D2 also saw (#33)."""
+    """Validate and exact-dedupe a draft for evaluation; retain the pilot hook signature."""
     if drafted is None:
         return None
-    passed = sum(1 for row in dev_results if isinstance(row, Mapping) and row.get("score") == 1.0)
-    view = DevPublicView({"c1.dev_pass_count": passed, "c1.dev_fail_count": len(dev_results) - passed})
-    return _admit(champion, drafted, decider, _envelope(champion, view))
+    return admit(champion, parse_entry(drafted), "add")
 
 
 def propose(champion: Candidate, reflection_records: Sequence[Mapping], splits: Splits,

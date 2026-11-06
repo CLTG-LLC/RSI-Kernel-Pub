@@ -32,8 +32,8 @@ In the guide's terms (Agent = Model + Harness), this is **teacher-update, harnes
  │            baseline = round-robin over components                         │
  │ 2 PROPOSE  in the isolated proposer runtime: reflective mutation          │
  │            (GEPA ProposalFn-style library call) writes the edit;          │
- │            for memory/skill artifacts Jev D4 advises add/merge/revise/    │
- │            discard here, so the evaluated library IS the admitted one     │
+ │            memory adapter: validate + exact-dedupe the draft as "add";    │
+ │            paired dev evaluation, not a D4 veto, decides selection (#45)   │
  │            → one Candidate hash                                           │
  │ 3 DEV EVAL budgeted (reserve before running), paired vs champion,         │
  │            dev-side non-regression check                                  │
@@ -61,7 +61,7 @@ In the guide's terms (Agent = Model + Harness), this is **teacher-update, harnes
 |---|---|
 | Two levels, retention on a hidden score | AIDE² arXiv 2609.26457: public score guides the inner loop, private score decides retention; held-out MLE-Bench Lite paired +0.053. The fixed per-evaluation allowance and the paired +0.053 (p=0.0024) figure are **blog-reported** (Weco blog post); +0.053 was not located in the paper text, so it stays unverified against the paper. |
 | Teacher update, not self-update | Guide §4: self-update can persist misdiagnoses. Recuris: a fixed meta-agent edits skill memory after validation. |
-| Admit inside propose, then evaluate the resulting library | Evo-Harness: the Evolver writes the batch's harness, which the next batch uses (guide §4). Here the **LLM proposer is the evolver**; Jev only advises its choice at D4. |
+| Draft candidate inside propose, then evaluate before selection | Memory adapter ([#45](https://github.com/CLTG-LLC/RSI-Kernel/issues/45)): validated, non-duplicate drafts become isolated candidates without a D4 veto; the existing paired dev rule decides selection. Precedents: [Voyager arXiv 2305.16291 §2.3](https://arxiv.org/abs/2305.16291), [Recursa arXiv 2611.04035 §5.1](https://arxiv.org/abs/2611.04035), and [GEPA arXiv 2507.19457](https://arxiv.org/abs/2507.19457). |
 | Dev-side non-regression | Growing Harness 2609.26760, Self-Harness 2606.09498, HarnessEvolve 2609.00829, DarwinX 2608.07545 and SkillEvoReg 2609.30861 all describe regression / non-regression gates. |
 | Duplicate suppression | **v1 simplification:** exact-hash suppression of candidates that showed a dev regression. Operational failures and inconclusive evaluations are not suppressed. Suppression applies **only within the same frozen campaign/evaluation context** (same champion, dev split and evaluator hashes) and is cleared when any of them changes. This is a simplified form of SkillSmith 2606.01314 version-scoped nogoods (scoped to component versions and invalidated when versions change); the full mechanism is not claimed. |
 | Noise floor | Phantom Gains 2608.20290: an unchanged-control arm. Separately, FinEvo-Bench's state-reset control measures gain from retained experience, which is a different construct. |
@@ -91,7 +91,7 @@ This applies the data-minimisation principle: GDPR Art. 5(1)(c), and OWASP LLM02
 | # | Question | Options | Baseline / fallback |
 |---|---|---|---|
 | D2 | Which component should change next? | registered component ids + "none" | round-robin component selection, GEPA's own default round-robin component selector |
-| D4 | For a proposed memory/skill entry: add / merge-with-X / revise-X / discard? | as listed | discard (conservative) |
+| D4 (legacy) | Retained for historical records and in-process compatibility; not called by memory adapter draft admission ([#45](https://github.com/CLTG-LLC/RSI-Kernel/issues/45)). Drafts are evaluated first, then judged by the existing paired dev rule (§2). | add / merge-with-X / revise-X / discard | discard (legacy only) |
 | D5 (optional) | Send this proposal to the cheap or strong proposer model? | cheap / strong | strong |
 
 **Never decided by Jev:** acceptance, release, labels, the evaluator, permissions, or stopping.
