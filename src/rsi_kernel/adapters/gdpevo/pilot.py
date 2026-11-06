@@ -16,14 +16,18 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import email.utils
 import hashlib
 import json
+import math
+import random
 import secrets
 import shutil
 import statistics
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Callable, Mapping
@@ -63,6 +67,132 @@ CALIBRATION_OUTPUT_SHA256 = "12308ca22e257b47c05099acec8679a9a06f2205c9987057888
 # Lead decision on #27: the proposer reaches the model only through the solver's
 # per-run forwarder (alias model-fwd, listen 8080, base /v1 as in SOLVER_COMMAND).
 PROPOSER_URL = "http://model-fwd:8080/v1/responses"
+# Transient-error retry, matching the official openai-python default (issue #57).
+# https://github.com/openai/openai-python/blob/v3.9.0/README.md#retries : "Certain
+# errors are automatically retried 2 times by default, with a short exponential backoff.
+# Connection errors ..., 408 Request Timeout, 409 Conflict, 429 Rate Limit, and >=500
+# Internal errors are all retried by default."
+# https://github.com/openai/openai-python/blob/v3.9.0/src/openai/_constants.py#L8
+DEFAULT_MAX_RETRIES = 2
+# .../_constants.py#L11-L12
+INITIAL_RETRY_DELAY = 0.5
+MAX_RETRY_DELAY = 8.0
+# .../_base_client.py#L801 caps a server-directed Retry-After at two minutes (MAX_RETRY_AFTER_DELAY).
+MAX_RETRY_AFTER_DELAY = 2 * 60
+# .../_base_client.py#L837-L855: 408, 409, 429 and >=500 are the retried statuses.
+RETRY_STATUSES = frozenset({408, 409, 429})
+
+
+def _retry_sleep(seconds: float) -> None:
+    """Injection point for tests; matches the SDK's blocking sleep between attempts."""
+    time.sleep(seconds)
+
+
+# Injection point for tests. The SDK imports it as ``from random import random``
+# (_base_client.py:16), so this is the same callable the SDK jitters with.
+_retry_random = random.random
+
+# "now" for HTTP-date Retry-After values; patched in tests (_base_client.py:789).
+_retry_now = time.time
+
+# Literal infinity spellings that _parse_retry_after_header does NOT treat as numeric
+# overflow: the SDK compares the stripped, lowercased text against these (_base_client.py:771).
+_INFINITY_LITERALS = ("inf", "+inf", "infinity", "+infinity")
+
+
+def _parse_retry_after(headers) -> float | None:
+    """Port of ``_parse_retry_after_header``, _base_client.py:753-789.
+
+    Order: ``retry-after-ms`` (milliseconds -> seconds) first, then ``retry-after`` as
+    a numeric number of seconds, then ``retry-after`` as an HTTP-date resolved against
+    ``_retry_now``. Anything unparseable returns None, which means "no server delay".
+
+    Numeric overflow (a value that parses to infinity but is not one of the literal
+    spellings, e.g. ``1e309``) returns ``MAX_RETRY_AFTER_DELAY + 1`` — the SDK's finite
+    sentinel, so retry eligibility refuses it rather than silently falling back to a
+    shorter wait (:771-776). A literal ``"inf"`` is returned as ``inf``; :817 requires
+    ``math.isfinite`` to refuse a retry, so it is retried and the delay falls back to
+    the exponential backoff via :801.
+    """
+    if headers is None:
+        return None
+    # :762-776 — prefer milliseconds, then seconds (nonstandard floats allowed).
+    for header, divisor in (("retry-after-ms", 1000), ("retry-after", 1)):
+        value = headers.get(header)
+        if value is None:
+            continue
+        try:
+            delay = float(value)
+        except ValueError:
+            continue
+        if delay == math.inf and value.strip().lower() not in _INFINITY_LITERALS:
+            return MAX_RETRY_AFTER_DELAY + 1  # :771-776, numeric overflow sentinel
+        return delay / divisor
+    # :778-789 — last, parse `retry-after` as an HTTP-date (RFC 9110 §10.2.3).
+    retry_header = headers.get("retry-after")
+    try:
+        retry_date_tuple = email.utils.parsedate_tz(retry_header)
+        if retry_date_tuple is None:
+            return None
+        retry_date = email.utils.mktime_tz(retry_date_tuple)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    return float(retry_date - _retry_now())
+
+
+def _retry_after(error: urllib.error.HTTPError) -> float | None:
+    """Parsed server delay from an HTTPError's response headers, or None."""
+    return _parse_retry_after(error.headers if error.headers else None)
+
+
+def _excessive(error: Exception) -> bool:
+    """_base_client.py:816-823: a finite delay greater than the 120 s cap refuses a retry.
+
+    Checked before the status rules and before ``x-should-retry``.
+    """
+    if not isinstance(error, urllib.error.HTTPError):
+        return False
+    after = _retry_after(error)
+    return after is not None and math.isfinite(after) and after > MAX_RETRY_AFTER_DELAY
+
+
+def _should_retry(error: urllib.error.HTTPError) -> bool:
+    """Port of ``_should_retry``, _base_client.py:815-857, in the SDK's exact order."""
+    if _excessive(error):
+        return False  # :817-823, server asked for more than we will wait
+    header = error.headers.get("x-should-retry") if error.headers else None  # :825-826
+    if header == "true":  # :829-831
+        return True
+    if header == "false":  # :832-834
+        return False
+    return error.code in RETRY_STATUSES or error.code >= 500  # :836-857
+
+
+def _retryable(error: Exception) -> bool:
+    """SDK _should_retry for HTTP errors; connection errors always retry (_base_client.py:1101)."""
+    if isinstance(error, urllib.error.HTTPError):
+        return _should_retry(error)
+    # URLError, socket timeouts and reset connections are all OSError subclasses.
+    # :1101-1108 retries any non-API exception while retries remain, with no status or
+    # Retry-After decision involved.
+    return isinstance(error, OSError)
+
+
+def _retry_delay(error: Exception, attempt: int) -> float:
+    """Retry delay, mirroring openai-python ``_calculate_retry_timeout``
+    (_base_client.py:791-813) step for step.
+
+    A server-directed Retry-After is returned unjittered at :802, before the jitter
+    block, so that path has none. Otherwise the exponential backoff at :808 is scaled
+    by ``1 - 0.25 * random()`` at :811-813, and a negative result clamps to 0.
+    """
+    if isinstance(error, urllib.error.HTTPError):
+        after = _retry_after(error)
+        if after is not None and math.isfinite(after) and 0 < after <= MAX_RETRY_AFTER_DELAY:
+            return after  # _base_client.py:801-802, before the jitter block
+    sleep_seconds = min(INITIAL_RETRY_DELAY * 2.0 ** attempt, MAX_RETRY_DELAY)  # :808
+    timeout = sleep_seconds * (1 - 0.25 * _retry_random())  # :811-812
+    return timeout if timeout >= 0 else 0  # :813
 
 
 class PilotStop(RuntimeError):
@@ -628,8 +758,22 @@ def http_model(calls_log: Path, url: str = PROPOSER_URL, timeout: float = TIMEOU
                                                           "reasoning": {"effort": EFFORT}}).encode(),
                                          headers={"Content-Type": "application/json"})
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(request, timeout=timeout) as response:
-            body = json.loads(response.read())
+        for attempt in range(DEFAULT_MAX_RETRIES + 1):
+            try:
+                with opener.open(request, timeout=timeout) as response:
+                    body = json.loads(response.read())
+                break
+            except OSError as error:  # HTTPError/URLError/socket timeouts are all OSError
+                if attempt == DEFAULT_MAX_RETRIES or not _retryable(error):
+                    raise
+                delay = _retry_delay(error, attempt)
+                # Retries are attempts of the same logical call: logged for the record,
+                # not metered again (see ContainerProposer._meter).
+                with calls_log.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps({"call": "retry", "attempt": attempt + 1,
+                                             "status": getattr(error, "code", None),
+                                             "error": type(error).__name__, "delay": delay}) + "\n")
+                _retry_sleep(delay)
         with calls_log.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps({"call": "usage", "token_usage": body.get("usage")}) + "\n")
         # Responses API: output[] message items carry output_text content parts.
@@ -698,11 +842,15 @@ class ContainerProposer:
 
     @staticmethod
     def _meter(path: Path, calls) -> None:
+        """One meter entry per logical call. A retried call stays one entry: ``retry``
+        rows are attempt records (issue #57), not extra spend, and skip forward to the
+        call's own ``usage`` (or the next ``started`` when it failed)."""
         rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
         for i, row in enumerate(rows):
-            if row["call"] == "started":
-                after = rows[i + 1] if i + 1 < len(rows) else {}
-                calls.log("proposer", after.get("token_usage") if after.get("call") == "usage" else None)
+            if row["call"] != "started":
+                continue
+            after = next((later for later in rows[i + 1:] if later["call"] in ("usage", "started")), {})
+            calls.log("proposer", after.get("token_usage") if after.get("call") == "usage" else None)
 
 
 def main(argv=None, hooks=SKILL) -> int:

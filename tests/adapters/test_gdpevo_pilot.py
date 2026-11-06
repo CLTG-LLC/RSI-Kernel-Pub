@@ -4,8 +4,10 @@ Fakes only: no Docker, network, live model or GDPevo data. Group/task ids
 mirror the prereg carving map; the toy wrapper is the existing fixture.
 """
 
+import email.utils
 import hashlib
 import json
+import math
 import shutil
 from pathlib import Path
 
@@ -373,6 +375,287 @@ def test_failed_http_call_is_still_metered(tmp_path, monkeypatch):
     calls = pilot._Calls(tmp_path / "metered.jsonl")
     pilot.ContainerProposer._meter(log, calls)
     assert calls.count == 1
+
+
+class _ScriptedServer:
+    """Real local HTTP server: each request pops one scripted response.
+
+    Script entries are ``(status, headers, body)``; a ``(status, headers, body)`` with
+    status 0 means "drop the connection" so urllib raises a genuine connection error.
+    """
+
+    def __init__(self, script):
+        import http.server
+        import threading
+        self.script, self.requests = list(script), []
+        server = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                server.requests.append(self.path)
+                status, headers, body = server.script.pop(0)
+                if status == 0:  # close without a response -> connection error
+                    self.close_connection = True
+                    self.wfile.close()
+                    return
+                self.send_response(status)
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/v1/responses"
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *args):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+OK_BODY = json.dumps({"usage": {"total_tokens": 3}, "output": [
+    {"type": "message", "content": [{"type": "output_text", "text": "ok"}]}]}).encode()
+
+
+def test_http_model_retries_502_then_succeeds(tmp_path, monkeypatch):
+    """Acceptance 1: transient 502 then 200 -> success on the second attempt."""
+    slept = []
+    monkeypatch.setattr(pilot, "_retry_sleep", slept.append)
+    monkeypatch.setattr(pilot, "_retry_random", lambda: 0.0)  # jitter 1 - 0.25*0 = 1
+    with _ScriptedServer([(502, {}, b""), (200, {}, OK_BODY)]) as server:
+        log = tmp_path / "calls.jsonl"
+        assert pilot.http_model(log, url=server.url)("prompt") == "ok"
+        assert len(server.requests) == 2
+    rows = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [r["call"] for r in rows] == ["started", "retry", "usage"]
+    assert rows[1]["status"] == 502 and rows[1]["attempt"] == 1
+    assert slept == [pilot.INITIAL_RETRY_DELAY]
+
+
+def test_http_model_gives_up_after_three_attempts(tmp_path, monkeypatch):
+    """Acceptance 2: three 502s -> the same operational failure as today, 3 attempts."""
+    monkeypatch.setattr(pilot, "_retry_sleep", lambda seconds: None)
+    with _ScriptedServer([(502, {}, b"")] * 3) as server:
+        log = tmp_path / "calls.jsonl"
+        with pytest.raises(pilot.urllib.error.HTTPError) as caught:
+            pilot.http_model(log, url=server.url)("prompt")
+        assert caught.value.code == 502
+        assert len(server.requests) == 3
+    calls = pilot._Calls(tmp_path / "metered.jsonl")
+    pilot.ContainerProposer._meter(log, calls)
+    # One logical proposer call against the spend cap; retries are logged, not metered again.
+    assert calls.count == 1
+    rows = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [r["call"] for r in rows] == ["started", "retry", "retry"]
+
+
+@pytest.mark.parametrize("status", [400, 401, 404])
+def test_http_model_does_not_retry_client_errors(tmp_path, monkeypatch, status):
+    """Acceptance 3: 400/401/404 are permanent -> exactly one attempt."""
+    slept = []
+    monkeypatch.setattr(pilot, "_retry_sleep", slept.append)
+    with _ScriptedServer([(status, {}, b"")] * 2) as server:
+        with pytest.raises(pilot.urllib.error.HTTPError) as caught:
+            pilot.http_model(tmp_path / "calls.jsonl", url=server.url)("prompt")
+        assert caught.value.code == status
+        assert len(server.requests) == 1
+    assert slept == []
+
+
+def test_http_model_honours_retry_after(tmp_path, monkeypatch):
+    """Acceptance 4: 429 with Retry-After: 0 is retried (SDK honours only 0 < value)."""
+    slept = []
+    monkeypatch.setattr(pilot, "_retry_sleep", slept.append)
+    # Draw 1.0 -> jitter factor 0.75. If the Retry-After path were jittered, 7 would
+    # come back as 5.25 and this assertion fails, proving _base_client.py:802 returns
+    # before the jitter block at :811-813.
+    monkeypatch.setattr(pilot, "_retry_random", lambda: 1.0)
+    with _ScriptedServer([(429, {"Retry-After": "0"}, b""),
+                          (429, {"Retry-After": "7"}, b""),
+                          (200, {}, OK_BODY)]) as server:
+        assert pilot.http_model(tmp_path / "calls.jsonl", url=server.url)("prompt") == "ok"
+        assert len(server.requests) == 3
+    # Retry-After 0 is not honoured as a server delay (SDK requires 0 < value), so that
+    # attempt uses the jittered backoff; Retry-After 7 is returned unjittered.
+    assert slept == [pytest.approx(pilot.INITIAL_RETRY_DELAY * 0.75), 7]
+
+
+def test_http_model_retries_connection_errors_with_exponential_backoff(tmp_path, monkeypatch):
+    """Connection errors retry too; backoff is INITIAL_RETRY_DELAY * 2**n, capped."""
+    slept = []
+    monkeypatch.setattr(pilot, "_retry_sleep", slept.append)
+    monkeypatch.setattr(pilot, "_retry_random", lambda: 0.0)
+    with _ScriptedServer([(0, {}, b""), (0, {}, b"")]) as server:
+        with pytest.raises(OSError):
+            pilot.http_model(tmp_path / "calls.jsonl", url=server.url)("prompt")
+        assert len(server.requests) == 3
+    assert slept == [pilot.INITIAL_RETRY_DELAY, pilot.INITIAL_RETRY_DELAY * 2]
+
+
+@pytest.mark.parametrize("draw, expected", [
+    (0.0, 1.0),     # jitter 1 - 0.25*0.0  = 1.00
+    (0.5, 0.875),   # jitter 1 - 0.25*0.5  = 0.875
+    (1.0, 0.75),    # jitter 1 - 0.25*1.0  = 0.75
+])
+def test_retry_delay_applies_sdk_jitter(monkeypatch, draw, expected):
+    """_base_client.py:811-813: ``sleep_seconds * (1 - 0.25 * random())``, clamped at 0."""
+    monkeypatch.setattr(pilot, "_retry_random", lambda: draw)
+    assert pilot._retry_delay(OSError("down"), 0) == pilot.INITIAL_RETRY_DELAY * expected
+
+
+def test_retry_delay_jitter_is_bounded_and_capped(monkeypatch):
+    """Jitter spans [0.75, 1.0] of the backoff; the 8 s cap applies before scaling."""
+    monkeypatch.setattr(pilot, "_retry_random", lambda: 0.0)
+    assert pilot._retry_delay(OSError("down"), 10) == pilot.MAX_RETRY_DELAY
+    # Attempts 0 and 1 stay under the cap, so they scale the raw backoff.
+    assert pilot._retry_delay(OSError("down"), 0) == pilot.INITIAL_RETRY_DELAY
+    assert pilot._retry_delay(OSError("down"), 1) == pilot.INITIAL_RETRY_DELAY * 2
+    monkeypatch.setattr(pilot, "_retry_random", lambda: 1.0)
+    assert pilot._retry_delay(OSError("down"), 10) == pytest.approx(pilot.MAX_RETRY_DELAY * 0.75)
+
+
+# --- SDK parity round (PR #62 review): parser, excessive delay, x-should-retry ---
+
+def _http_error(status, headers=None):
+    """urllib HTTPError carrying real response headers, for the decision-level tests."""
+    return pilot.urllib.error.HTTPError(
+        "http://model-fwd:8080/v1/responses", status, "err", _headers(headers or {}), None)
+
+
+def _headers(mapping):
+    message = email.message.Message()
+    for name, value in mapping.items():
+        message[name] = value
+    return message
+
+
+def test_parse_retry_after_prefers_milliseconds_then_seconds(monkeypatch):
+    """_base_client.py:762-776: retry-after-ms (ms -> s) wins over retry-after."""
+    assert pilot._parse_retry_after({"retry-after-ms": "1500"}) == 1.5
+    assert pilot._parse_retry_after({"retry-after-ms": "1500", "retry-after": "9"}) == 1.5
+    assert pilot._parse_retry_after({"retry-after": "9"}) == 9.0
+    assert pilot._parse_retry_after({"retry-after": "2.5"}) == 2.5  # nonstandard float allowed
+    assert pilot._parse_retry_after({}) is None
+
+
+def test_parse_retry_after_malformed_is_none(monkeypatch):
+    """_base_client.py:767-770,786-787: unparseable numerics fall through; bad dates -> None."""
+    assert pilot._parse_retry_after({"retry-after-ms": "soon"}) is None
+    assert pilot._parse_retry_after({"retry-after": "later"}) is None
+    assert pilot._parse_retry_after({"retry-after": ""}) is None
+
+
+def test_parse_retry_after_excessive_numeric_overflow(monkeypatch):
+    """_base_client.py:771-775: numeric overflow is an excessive delay sentinel, not None."""
+    # 1e309 parses to inf but is not the literal infinity spelling -> sentinel.
+    assert pilot._parse_retry_after({"retry-after": "1e309"}) == pilot.MAX_RETRY_AFTER_DELAY + 1
+    assert pilot._parse_retry_after({"retry-after-ms": "1e400"}) == pilot.MAX_RETRY_AFTER_DELAY + 1
+
+
+def test_parse_retry_after_literal_infinity_follows_sdk(monkeypatch):
+    """_base_client.py:771 exempts the literal spellings from the overflow sentinel, so
+    they return the parsed double (inf). :817 requires isfinite to refuse a retry, so an
+    infinity is NOT treated as excessive: the call is retried, and :801's isfinite guard
+    makes the delay fall back to exponential backoff. Only numeric overflow is refused."""
+    for literal in ("inf", "infinity", "+inf", "+Infinity", " INF "):
+        parsed = pilot._parse_retry_after({"retry-after": literal})
+        assert parsed == float("inf") and not math.isfinite(parsed)
+    inf_error = _http_error(502, {"retry-after": "inf"})
+    assert pilot._retryable(inf_error) is True
+    # The delay ignores the non-finite value and uses the backoff (:801 isfinite guard).
+    monkeypatch.setattr(pilot, "_retry_random", lambda: 0.0)
+    assert pilot._retry_delay(inf_error, 0) == pilot.INITIAL_RETRY_DELAY
+
+
+def test_parse_retry_after_http_date_is_relative_to_now(monkeypatch):
+    """_base_client.py:778-789: HTTP-date becomes seconds from now."""
+    monkeypatch.setattr(pilot, "_retry_now", lambda: 1_800_000_000.0)
+    future = email.utils.formatdate(1_800_000_030, usegmt=True)
+    assert pilot._parse_retry_after({"retry-after": future}) == pytest.approx(30, abs=1)
+    past = email.utils.formatdate(1_799_999_970, usegmt=True)
+    assert pilot._parse_retry_after({"retry-after": past}) == pytest.approx(-30, abs=1)
+
+
+def test_retry_after_boundary_120_is_retried_and_121_is_not(monkeypatch):
+    """_base_client.py:817-823: >120 s (inclusive at 120) refuses retry; 120 is allowed."""
+    slept = []
+    monkeypatch.setattr(pilot, "_retry_sleep", slept.append)
+    monkeypatch.setattr(pilot, "_retry_random", lambda: 0.0)
+    assert pilot._retryable(_http_error(502, {"retry-after": "120"})) is True
+    assert pilot._retryable(_http_error(502, {"retry-after": "121"})) is False
+    assert pilot._retryable(_http_error(502, {"retry-after": "1e309"})) is False
+    assert pilot._retry_delay(_http_error(502, {"retry-after": "120"}), 0) == 120
+
+
+def test_excessive_retry_after_body_returns_no_retry(tmp_path, monkeypatch):
+    """End to end: a 502 with Retry-After 121 makes exactly one attempt, no sleep."""
+    slept = []
+    monkeypatch.setattr(pilot, "_retry_sleep", slept.append)
+    with _ScriptedServer([(502, {"Retry-After": "121"}, b"")] * 2) as server:
+        with pytest.raises(pilot.urllib.error.HTTPError):
+            pilot.http_model(tmp_path / "calls.jsonl", url=server.url)("prompt")
+        assert len(server.requests) == 1
+    assert slept == []
+
+
+def test_x_should_retry_header_overrides_status(monkeypatch):
+    """_base_client.py:825-834: true -> retry, false -> no retry, checked before status."""
+    assert pilot._retryable(_http_error(502, {"x-should-retry": "false"})) is False
+    assert pilot._retryable(_http_error(400, {"x-should-retry": "true"})) is True
+    # Unrecognised values fall through to the status rules.
+    assert pilot._retryable(_http_error(502, {"x-should-retry": "maybe"})) is True
+    assert pilot._retryable(_http_error(400, {"x-should-retry": "maybe"})) is False
+
+
+def test_x_should_retry_true_retries_a_400_end_to_end(tmp_path, monkeypatch):
+    """A 400 that the server marks retryable is retried on the wire."""
+    slept = []
+    monkeypatch.setattr(pilot, "_retry_sleep", slept.append)
+    monkeypatch.setattr(pilot, "_retry_random", lambda: 0.0)
+    with _ScriptedServer([(400, {"x-should-retry": "true"}, b""), (200, {}, OK_BODY)]) as server:
+        assert pilot.http_model(tmp_path / "calls.jsonl", url=server.url)("prompt") == "ok"
+        assert len(server.requests) == 2
+    assert slept == [pilot.INITIAL_RETRY_DELAY]
+
+
+def test_meter_counts_successful_retry_as_one_entry(tmp_path, monkeypatch):
+    """Accounting: a retried-then-successful call is ONE proposer entry with its usage."""
+    monkeypatch.setattr(pilot, "_retry_sleep", lambda seconds: None)
+    monkeypatch.setattr(pilot, "_retry_random", lambda: 0.0)
+    log = tmp_path / "calls.jsonl"
+    with _ScriptedServer([(502, {}, b""), (200, {}, OK_BODY)]) as server:
+        assert pilot.http_model(log, url=server.url)("prompt") == "ok"
+    calls = pilot._Calls(tmp_path / "metered.jsonl")
+    pilot.ContainerProposer._meter(log, calls)
+    assert calls.count == 1
+    assert json.loads((tmp_path / "metered.jsonl").read_text()) == {
+        "kind": "proposer", "token_usage": {"total_tokens": 3}}
+
+
+def test_meter_does_not_leak_usage_across_a_failed_call(tmp_path, monkeypatch):
+    """Accounting: a failed call must not take the NEXT call's usage."""
+    monkeypatch.setattr(pilot, "_retry_sleep", lambda seconds: None)
+    monkeypatch.setattr(pilot, "_retry_random", lambda: 0.0)
+    log = tmp_path / "calls.jsonl"
+    with _ScriptedServer([(502, {}, b"")] * 3) as server:
+        with pytest.raises(pilot.urllib.error.HTTPError):
+            pilot.http_model(log, url=server.url)("first")
+    with _ScriptedServer([(200, {}, OK_BODY)]) as server:
+        assert pilot.http_model(log, url=server.url)("second") == "ok"
+    calls = pilot._Calls(tmp_path / "metered.jsonl")
+    pilot.ContainerProposer._meter(log, calls)
+    rows = [json.loads(line) for line in (tmp_path / "metered.jsonl").read_text().splitlines()]
+    assert calls.count == 2
+    assert rows[0] == {"kind": "proposer", "token_usage": None}  # failed call: no usage
+    assert rows[1] == {"kind": "proposer", "token_usage": {"total_tokens": 3}}
 
 
 def test_container_proposer_uses_internal_network_and_shared_forwarder(tree, monkeypatch):
