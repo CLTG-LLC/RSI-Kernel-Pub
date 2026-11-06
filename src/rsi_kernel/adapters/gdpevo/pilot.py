@@ -458,8 +458,11 @@ def final_phase(*, root: Path, run_dir: Path, group: str, champions: Mapping, so
     frozen = {k: state.get(k) for k in ("champion_id", "evaluator_hash", "code_hash")}
     champion = hooks.load_champion(champions[group])
     tasks = frozen_tasks(root, group)
-    if not _identity_ok(frozen, _identity(champion, tasks), champion.id, _rebind_record(run_dir, group)):
+    rebind = _rebind_record(run_dir, group)
+    if not _identity_ok(frozen, _identity(champion, tasks), champion.id, rebind):
         raise PilotStop(f"frozen identity drift in {group}")
+    # Issue #42: approval binds the validated code identity (frozen, or the rebind's ``to``).
+    code_hash = (rebind["to"] if rebind is not None else frozen)["code_hash"]
     tasks = _prerun(root, run_dir, [group], calibration_answer, calibration_replay)[group]
     final_dir.mkdir(parents=True, exist_ok=True)
     entropy = run_dir / "entropy.json"
@@ -499,7 +502,7 @@ def final_phase(*, root: Path, run_dir: Path, group: str, champions: Mapping, so
     replay = _Replay(records, champion.id, candidate.id if candidate else None)
     result = accept(
         campaign_id=group, candidate=candidate, champion=champion, adjudicate=replay.evaluate,
-        adjudication_item_ids=adj, evaluator_hash=_evaluator_hash(tasks),
+        adjudication_item_ids=adj, evaluator_hash=_evaluator_hash(tasks), code_hash=code_hash,
         retain=lambda comparison: valid and _zero_margin(comparison),
         approval=_file_approval(group_dir, wait), adapter=adapter, archive=adapter.archive,
         runs=RUNS, holdout=replay.evaluate, holdout_item_ids=hold)

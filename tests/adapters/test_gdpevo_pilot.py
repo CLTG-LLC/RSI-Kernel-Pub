@@ -90,7 +90,7 @@ def approve_matching(path):
     request = json.loads(path.read_text())
     (path.parent / "approval.json").write_text(json.dumps({
         "candidate_hash": request["candidate_hash"], "evaluator_hash": request["evaluator_hash"],
-        "data_hash": request["data_hash"], "approver": "Billy"}))
+        "data_hash": request["data_hash"], "code_hash": request["code_hash"], "approver": "Billy"}))
 
 
 def final(tree, fakes, group, wait=approve_matching):
@@ -283,6 +283,9 @@ def test_matching_approval_is_updated_record_only(tree):
     assert results[group].outcome == "updated"
     decisions = [json.loads(line) for line in (tree[1] / group / "private/decisions.jsonl").read_text().splitlines()]
     assert {"candidate_id": results[group].request.candidate_hash, "mode": "record-only"} in decisions
+    # Issue #42: the approval request binds the campaign's frozen full-code hash.
+    request = json.loads((tree[1] / group / "approval-request.json").read_text())
+    assert request["code_hash"] == json.loads((tree[1] / group / "campaign.json").read_text())["code_hash"]
     champion = Path(tree[2][group]["path"]).read_text()
     assert champion == f"# {group} skill\n"
 
@@ -472,7 +475,10 @@ def test_code_change_between_phases_stops_then_a_valid_rebind_proceeds(tree, tmp
     assert record["addendum_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
     stored = json.loads((tree[1] / "task_group_001/rebind.json").read_text())
     assert stored == record
-    assert final(tree, fakes, "task_group_001").outcome == "updated"
+    result = final(tree, fakes, "task_group_001")
+    assert result.outcome == "updated"
+    # Issue #42: approval binds the rebound (running) code, not the original frozen one.
+    assert result.request.code_hash == record["to"]["code_hash"] != record["from"]["code_hash"]
 
 
 def test_rebind_with_wrong_from_or_changed_champion_stops_before_solver(tree, tmp_path, monkeypatch):

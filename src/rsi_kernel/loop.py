@@ -205,6 +205,7 @@ class ApprovalRequest:
     candidate_hash: str
     evaluator_hash: str
     data_hash: str
+    code_hash: str  # full kernel + adapter code identity (prereg "Acceptance", #42)
 
 
 @dataclass(frozen=True)
@@ -212,6 +213,7 @@ class ApprovalRecord:
     candidate_hash: str
     evaluator_hash: str
     data_hash: str
+    code_hash: str
     approver: str
 
 
@@ -229,7 +231,7 @@ class AcceptResult:
 
 def accept(*, campaign_id: str, candidate: Optional[Candidate], champion: Candidate,
            adjudicate: Callable[[Candidate, Sequence[str]], Sequence[dict]],
-           adjudication_item_ids: Sequence[str], evaluator_hash: str, retain: Rule,
+           adjudication_item_ids: Sequence[str], evaluator_hash: str, code_hash: str, retain: Rule,
            approval: Callable[[ApprovalRequest], Optional[ApprovalRecord]], adapter,
            archive: Archive, runs: int, holdout: Optional[Callable[[Candidate, Sequence[str]], Sequence[dict]]] = None,
            holdout_item_ids: Sequence[str] = ()) -> AcceptResult:
@@ -249,12 +251,12 @@ def accept(*, campaign_id: str, candidate: Optional[Candidate], champion: Candid
     if (comparison.blocks_acceptance or (holdout_cmp is not None and holdout_cmp.blocks_acceptance)
             or not retain(comparison)):
         return _decided(archive, campaign_id, "failed_gate", comparison, None, holdout_cmp)
-    request = ApprovalRequest(campaign_id, candidate.id, evaluator_hash, _evaluation_hash(adj, runs))
+    request = ApprovalRequest(campaign_id, candidate.id, evaluator_hash, _evaluation_hash(adj, runs), code_hash)
     archive.record_decision({"kind": "approval_request", **request.__dict__})
     record = approval(request)
     matches = (isinstance(record, ApprovalRecord) and
-               (record.candidate_hash, record.evaluator_hash, record.data_hash)
-               == (request.candidate_hash, request.evaluator_hash, request.data_hash))
+               (record.candidate_hash, record.evaluator_hash, record.data_hash, record.code_hash)
+               == (request.candidate_hash, request.evaluator_hash, request.data_hash, request.code_hash))
     if not matches:
         return _decided(archive, campaign_id, "not_updated", comparison, request, holdout_cmp)
     archive.record_decision({"kind": "approval", "campaign_id": campaign_id, **record.__dict__})

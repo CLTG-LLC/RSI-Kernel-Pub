@@ -20,6 +20,7 @@ from rsi_kernel.loop import (
 DEV = ("d1", "d2")
 ADJ = ("a1", "a2")
 HOLD = ("h1",)
+CODE_HASH = "code-hash"
 EVAL_HASH = "evaluator-v1"
 
 
@@ -219,7 +220,7 @@ def do_accept(host, archive, candidate, *, approval, scores=None, campaign_id="c
     adj = scores if isinstance(scores, Adjudicator) else Adjudicator(scores or {"champ": 0.5, "b": 0.9})
     result = accept(
         campaign_id=campaign_id, candidate=candidate, champion=host.get_artifact(),
-        adjudicate=adj, adjudication_item_ids=adj_ids, evaluator_hash=EVAL_HASH,
+        adjudicate=adj, adjudication_item_ids=adj_ids, evaluator_hash=EVAL_HASH, code_hash=CODE_HASH,
         retain=ge_zero, approval=approval, adapter=host, archive=archive, runs=runs,
         holdout=adj if holdout else None, holdout_item_ids=HOLD if holdout else (),
     )
@@ -227,7 +228,8 @@ def do_accept(host, archive, candidate, *, approval, scores=None, campaign_id="c
 
 
 def approve_exact(request):
-    return ApprovalRecord(request.candidate_hash, request.evaluator_hash, request.data_hash, "approver")
+    return ApprovalRecord(request.candidate_hash, request.evaluator_hash, request.data_hash, request.code_hash,
+                          "approver")
 
 
 def test_accept_applies_only_with_matching_approval(archive):
@@ -235,9 +237,10 @@ def test_accept_applies_only_with_matching_approval(archive):
     result, _ = do_accept(host, archive, cand("b"), approval=approve_exact)
     assert result.outcome == "updated" and host.applied == [cand("b").id]
     assert result.request.candidate_hash == cand("b").id and result.request.evaluator_hash == EVAL_HASH
+    assert result.request.code_hash == CODE_HASH
 
 
-@pytest.mark.parametrize("field", ["candidate_hash", "evaluator_hash", "data_hash"])
+@pytest.mark.parametrize("field", ["candidate_hash", "evaluator_hash", "data_hash", "code_hash"])
 def test_hash_mismatch_is_refused(archive, field):
     host = FakeHost(cand("champ"), {})
 
@@ -290,7 +293,7 @@ def test_holdout_reported_once_per_campaign(archive):
     second = Adjudicator({"champ": 0.5, "b": 0.9})
     with pytest.raises(CampaignClosed):
         accept(campaign_id="camp-1", candidate=cand("b"), champion=host.get_artifact(),
-               adjudicate=second, adjudication_item_ids=ADJ, evaluator_hash=EVAL_HASH,
+               adjudicate=second, adjudication_item_ids=ADJ, evaluator_hash=EVAL_HASH, code_hash=CODE_HASH,
                retain=ge_zero, approval=approve_exact, adapter=host, archive=archive,
                holdout=second, holdout_item_ids=HOLD, runs=1)
     assert second.calls == []
