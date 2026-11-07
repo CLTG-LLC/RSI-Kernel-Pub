@@ -47,6 +47,9 @@ from .tasks import FrozenTask, carve_splits
 
 # Prereg "Objective and diagnostic scope" and "Carving map".
 GROUPS = ("task_group_001", "task_group_002", "task_group_003")
+# docs/prereg-e2-skill-groups.md §2.1 (issue #113): the next six read_only groups.
+E2_GROUPS = tuple(f"task_group_{n:03d}" for n in range(4, 10))
+REGISTERED_GROUPS = GROUPS + E2_GROUPS  # driver/CLI guards admit exactly 001-009
 DEV_IDS = ("001", "002", "003")
 ADJ_IDS = ("004", "005")
 TRAIN_IDS = DEV_IDS + ADJ_IDS
@@ -61,8 +64,9 @@ TIMEOUT = 3600  # solver wall time and evaluator timeout, both 3600 s
 # Prereg "Schedule" arm order; the control and the dev re-run are dropped by the S4
 # addendum (#36): upstream compares conditions with acc@3 on test only.
 ARMS = ("champion", "candidate")
-# Prereg "Calibration (reproduced)": feasibility attempt 8, the first dev task.
-CALIBRATION_TASK = (GROUPS[0], "train", DEV_IDS[0])
+# Prereg "Calibration (reproduced)": feasibility attempt 8, the first dev task. Pinned
+# literally, independent of the registered group set (E2 prereg §3 STOP 4).
+CALIBRATION_TASK = ("task_group_001", "train", "001")
 CALIBRATION_ANSWER_SHA256 = "5eb5cc630e4f69d1892b2fe721a593b8eb83513c96b723ff4c0f756e518ae96b"
 CALIBRATION_OUTPUT_SHA256 = "12308ca22e257b47c05099acec8679a9a06f2205c99870578885098adbf6205e"
 # Lead decision on #27: the proposer reaches the model only through the solver's
@@ -374,8 +378,11 @@ class _MeteredBackend:
         self.name, self.model = backend.name, backend.model
 
     def decide(self, envelope):
-        self.calls.log("jev")
-        return self.backend.decide(envelope)
+        # Failed calls are still metered; provider usage only when the backend reported it.
+        try:
+            return self.backend.decide(envelope)
+        finally:
+            self.calls.log("jev", getattr(self.backend, "last_usage", None))
 
 
 def in_process_proposer(model, hooks=SKILL):
@@ -416,7 +423,7 @@ def optimise_group(*, root: Path, run_dir: Path, group: str, champion: Mapping, 
                    jev, calibration_answer: Path, calibration_replay, hooks=SKILL):
     """``proposer(champion, records, splits, calls)``: in_process_proposer or ContainerProposer."""
     root, run_dir = Path(root), Path(run_dir)
-    if group not in GROUPS or not run_dir.is_absolute():
+    if group not in REGISTERED_GROUPS or not run_dir.is_absolute():
         raise PilotStop("unknown group or relative run directory")
     group_dir = run_dir / group
     if (group_dir / "campaign.json").exists():
@@ -547,7 +554,7 @@ def rebind(*, root: Path, run_dir: Path, group: str, champion: Mapping, addendum
     ``to`` is the identity of the code and inputs that will actually run the final.
     """
     root, run_dir, addendum = Path(root), Path(run_dir), Path(addendum)
-    if group not in GROUPS or not run_dir.is_absolute():
+    if group not in REGISTERED_GROUPS or not run_dir.is_absolute():
         raise PilotStop("unknown group or relative run directory")
     group_dir = run_dir / group
     state = json.loads((group_dir / "campaign.json").read_text())
@@ -572,7 +579,7 @@ def final_phase(*, root: Path, run_dir: Path, group: str, champions: Mapping, so
                 hooks: Hooks = SKILL) -> AcceptResult:
     """One group's frozen comparison (S4 addendum, #36): adjudication and holdout only."""
     root, run_dir = Path(root), Path(run_dir)
-    if group not in GROUPS or not run_dir.is_absolute():
+    if group not in REGISTERED_GROUPS or not run_dir.is_absolute():
         raise PilotStop("unknown group or relative run directory")
     group_dir = run_dir / group
     state_path = group_dir / "campaign.json"
@@ -667,7 +674,7 @@ def _run_spread(rows) -> float | None:
     return sum(spreads) / len(spreads) if spreads else None
 
 
-def _report_groups(run_dir: Path) -> tuple[list[str], list[str], list[str]]:
+def _report_groups(run_dir: Path, groups=GROUPS) -> tuple[list[str], list[str], list[str]]:
     """(paired, no_candidate, stopped) groups, each from its own campaign record.
 
     A group whose campaign stopped operationally never wrote the closed record, so
@@ -676,7 +683,7 @@ def _report_groups(run_dir: Path) -> tuple[list[str], list[str], list[str]]:
     not a no-candidate group, and it is not a source of report rows.
     """
     paired, no_candidate, stopped = [], [], []
-    for group in GROUPS:
+    for group in groups:
         state = json.loads((run_dir / group / "campaign.json").read_text())
         if "selected" not in state:
             stopped.append(group)
@@ -687,14 +694,14 @@ def _report_groups(run_dir: Path) -> tuple[list[str], list[str], list[str]]:
     return paired, no_candidate, stopped
 
 
-def report(run_dir: Path, root: Path, outcome: str) -> list[dict]:
+def report(run_dir: Path, root: Path, outcome: str, groups=GROUPS) -> list[dict]:
     """Report inputs (S4 addendum, #36): dev from the optimise archive, then adjudication
     and holdout; noise is the champion's run-to-run spread on dev, not a control arm."""
     from ...analysis import report_table
     run_dir, root = Path(run_dir), Path(root)
     # Paired tables cover only groups with a selected candidate; a no-candidate group
     # has no pairs and is reported as such, never as fabricated candidate rows.
-    paired, unpaired, stopped = _report_groups(run_dir)
+    paired, unpaired, stopped = _report_groups(run_dir, groups)
     dev = [row for group in [*paired, *unpaired] for row in _dev_rows(run_dir / group)]
     noise = _run_spread([r for r in dev if r["arm"] == "champion"])
     if len(paired) < 2:
@@ -709,7 +716,7 @@ def report(run_dir: Path, root: Path, outcome: str) -> list[dict]:
     final = [json.loads(line) for group in paired
              for line in (run_dir / "final" / group / "observations.jsonl").read_text().splitlines()]
     purpose_of = {}
-    for group in GROUPS:
+    for group in groups:
         splits = carve_splits(frozen_tasks(root, group), {group: list(DEV_IDS)})
         purpose_of.update({item: purpose for purpose in ("adjudication", "holdout")
                            for item in splits.item_ids(purpose)})
@@ -879,7 +886,7 @@ def main(argv=None, hooks=SKILL) -> int:
         return 0
     parser.add_argument("phase", choices=("optimise", "final", "rebind"))
     parser.add_argument("--config", required=True, type=Path)
-    parser.add_argument("--group", choices=GROUPS)
+    parser.add_argument("--group", choices=REGISTERED_GROUPS)
     parser.add_argument("--addendum", type=Path)
     args = parser.parse_args(argv)
     if args.phase != "optimise" and args.group is None:

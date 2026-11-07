@@ -103,3 +103,19 @@ def test_edited_envelope_is_rejected_before_http_and_without_echo(part):
     with pytest.raises(ValueError) as error:
         JevBackend(URL).decide(request)
     assert CANARY not in str(error.value)
+
+
+def test_jev_records_provider_usage_only_when_reported(monkeypatch):
+    """Issue #113 D2 metering: usage as the provider reported it, None when absent."""
+    backend = JevBackend(URL)
+    answers = {"D2": {"choice": "c3"}, "D4": {"choice": "discard"}, "D5": {"choice": "cheap"}}
+    mock_http(monkeypatch, json.dumps({"answers": answers, "usage": {"total_tokens": 7}}).encode(), [])
+    backend.decide(envelope())
+    assert backend.last_usage == {"total_tokens": 7}
+    mock_http(monkeypatch, response(answers), [])
+    backend.decide(envelope())
+    assert backend.last_usage is None
+    mock_http(monkeypatch, b"[]", [])
+    with pytest.raises(DecisionError):
+        backend.decide(envelope())
+    assert backend.last_usage is None

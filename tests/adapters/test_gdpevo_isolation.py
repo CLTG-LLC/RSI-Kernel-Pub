@@ -16,9 +16,18 @@ EXCLUSIONS = [
       ("task_group", "runs", "original_traces", "scratch", "report", "skills")],
     "data/task_groups/toy/train_tasks/002/input/prompt.txt",
 ]
+# Issue #113: the same exclusions for every registered pilot group, 001-009.
+REGISTERED = [f"task_group_{n:03d}" for n in range(1, 10)]
+GROUP_EXCLUSIONS = [path.replace("/toy/", f"/{group}/") for group in REGISTERED
+                    for path in EXCLUSIONS if "/toy/" in path]
 
 
-@pytest.mark.parametrize("relative", EXCLUSIONS)
+def test_group_exclusions_cover_exactly_the_registered_groups():
+    from rsi_kernel.adapters.gdpevo import pilot
+    assert list(pilot.REGISTERED_GROUPS) == REGISTERED
+
+
+@pytest.mark.parametrize("relative", EXCLUSIONS + GROUP_EXCLUSIONS)
 @pytest.mark.parametrize("mount", ["dev_data_dir", "output_dir"])
 def test_gdpevo_e0_protected_mounts_denied(host, relative, mount):
     adapter = host[0]

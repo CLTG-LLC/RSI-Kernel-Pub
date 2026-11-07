@@ -1251,3 +1251,94 @@ def test_addendum_identities_match_the_frozen_s4_commit(tmp_path):
     assert pilot._code_hash(package, lock, exclude=("adapters",)) == S4_KERNEL_ONLY_HASH
     # The exclusion is what separates them: the two identities are not the same number.
     assert S4_FULL_CODE_HASH != S4_KERNEL_ONLY_HASH
+
+
+# Issue #113: driver support for the registered E2 group set (docs/prereg-e2-skill-groups.md §2.1, §2.3).
+E2_GROUPS = tuple(f"task_group_{n:03d}" for n in range(4, 10))
+
+
+def test_registered_groups_are_exactly_001_to_009():
+    assert pilot.GROUPS == ("task_group_001", "task_group_002", "task_group_003")  # historical set unchanged
+    assert pilot.E2_GROUPS == E2_GROUPS
+    assert pilot.REGISTERED_GROUPS == pilot.GROUPS + E2_GROUPS
+
+
+def test_calibration_identity_is_pinned_independent_of_group_set():
+    """E2 prereg §3 STOP 4: task_group_001/train/001 with the recorded answer/output sha256."""
+    assert pilot.CALIBRATION_TASK == ("task_group_001", "train", "001")
+    assert pilot.CALIBRATION_ANSWER_SHA256 == "5eb5cc630e4f69d1892b2fe721a593b8eb83513c96b723ff4c0f756e518ae96b"
+    assert pilot.CALIBRATION_OUTPUT_SHA256 == "12308ca22e257b47c05099acec8679a9a06f2205c99870578885098adbf6205e"
+    import inspect
+    assert "GROUPS[0]" not in inspect.getsource(pilot)
+
+
+@pytest.mark.parametrize("group", E2_GROUPS)
+def test_e2_group_optimise_and_final_run_with_the_same_calibration(tree, group):
+    root, run_dir, champions, answer = tree
+    for subset, ids in (("train", pilot.TRAIN_IDS), ("test", pilot.TEST_IDS)):
+        for task_id in ids:
+            shutil.copytree(TOY, root / "data/task_groups" / group / f"{subset}_tasks" / task_id)
+    champions[group] = champions["task_group_001"]
+    fakes = Fakes()
+    assert optimise(tree, fakes, group).outcome == "selected"
+    assert {item for _, item in fakes.solver_calls} == {f"{group}/train/{i}" for i in pilot.DEV_IDS}
+    assert final(tree, fakes, group).outcome == "updated"
+    assert fakes.replays == [answer, answer]  # same pinned calibration answer for both phases
+
+
+@pytest.mark.parametrize("group", ["task_group_000", "task_group_010", "task_group_022", "toy"])
+def test_unregistered_groups_stop_before_any_solve(tree, group):
+    fakes = Fakes()
+    tree[2][group] = tree[2]["task_group_001"]
+    with pytest.raises(pilot.PilotStop, match="unknown group"):
+        optimise(tree, fakes, group)
+    assert not fakes.solver_calls
+
+
+def test_cli_group_choices_are_exactly_the_registered_set(tmp_path):
+    config = tmp_path / "config.json"
+    config.write_text("{}")
+    with pytest.raises(SystemExit):
+        pilot.main(["final", "--config", str(config), "--group", "task_group_010"])
+    for group in ("task_group_004", "task_group_009"):
+        with pytest.raises(KeyError):  # argparse accepted the group; the empty config fails next
+            pilot.main(["final", "--config", str(config), "--group", group])
+
+
+def test_report_takes_the_e2_group_set_explicitly(tree):
+    root, run_dir, champions, _ = tree
+    for group in E2_GROUPS[:2]:
+        for subset, ids in (("train", pilot.TRAIN_IDS), ("test", pilot.TEST_IDS)):
+            for task_id in ids:
+                shutil.copytree(TOY, root / "data/task_groups" / group / f"{subset}_tasks" / task_id)
+        champions[group] = champions["task_group_001"]
+        fakes = Fakes()
+        optimise(tree, fakes, group)
+        final(tree, fakes, group)
+    rows = pilot.report(run_dir, root, "updated", groups=E2_GROUPS[:2])
+    assert all(r["paired_groups"] == list(E2_GROUPS[:2]) for r in rows)
+
+
+def test_d2_metering_records_provider_usage_when_present_else_null(tmp_path):
+    calls = pilot._Calls(tmp_path / "calls.jsonl")
+
+    class Backend:
+        name, model = "jev", "jev-latest"
+        last_usage = None
+
+        def __init__(self, usage, fail=False):
+            self.usage, self.fail = usage, fail
+
+        def decide(self, envelope):
+            self.last_usage = self.usage
+            if self.fail:
+                raise ValueError("synthetic failure")
+            return {"D2": "c1"}
+
+    pilot._MeteredBackend(Backend({"total_tokens": 5}), calls).decide({})
+    pilot._MeteredBackend(Backend(None), calls).decide({})
+    with pytest.raises(ValueError):
+        pilot._MeteredBackend(Backend(None, fail=True), calls).decide({})
+    rows = [json.loads(line) for line in (tmp_path / "calls.jsonl").read_text().splitlines()]
+    assert rows == [{"kind": "jev", "token_usage": {"total_tokens": 5}},
+                    {"kind": "jev", "token_usage": None}, {"kind": "jev", "token_usage": None}]

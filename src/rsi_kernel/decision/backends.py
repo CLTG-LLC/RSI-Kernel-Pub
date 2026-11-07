@@ -38,8 +38,10 @@ class JevBackend:
     def __init__(self, url, model="jev-latest", timeout=120):
         # 120 seconds is the existing jev_decide default, not a tuned limit.
         self.url, self.model, self.timeout = url, model, timeout
+        self.last_usage = None  # provider-reported usage of the last call, None if absent
 
     def decide(self, envelope):
+        self.last_usage = None
         validate_envelope(envelope)
         key = os.environ.get("EXPERIENTIAL_API_KEY")
         if not key:
@@ -54,6 +56,8 @@ class JevBackend:
         try:
             with opener.open(request, timeout=self.timeout) as stream:
                 response = json.loads(stream.read())
+            usage = response.get("usage")
+            self.last_usage = usage if isinstance(usage, dict) else None
             answers = {name: answer["choice"] for name, answer in response["answers"].items()}
         except TimeoutError:
             raise DecisionError("timeout") from None
