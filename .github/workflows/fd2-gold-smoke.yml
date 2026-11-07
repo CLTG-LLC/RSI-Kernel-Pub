@@ -40,137 +40,19 @@ jobs:
             --dataset-dir "$(cat smoke/dataset-path.txt)" \
             --output smoke/frozen.jsonl
       - name: Run three independent gold evaluations per instance
-        working-directory: SWE-bench-Live
-        env:
-          DATASET_PATH_FILE: ../smoke/pinned.jsonl
-          SELECTION: ../smoke/selection.json
-          ROWS: ../smoke/runs.ndjson
-          OUTPUT: ../smoke/output
         run: |
-          set -u
-          mkdir -p "$OUTPUT" ../smoke/harness-logs
-          cp ../smoke/frozen.jsonl "$DATASET_PATH_FILE"
-          : > "$ROWS"
-          while IFS=$'\t' read -r instance_id split image; do
-            if ! docker pull "$image" > ../smoke/harness-logs/pull.log 2>&1; then
-              printf 'Image pull failed; stopping before evaluation: %s\n' "$instance_id"
-              break
-            fi
-            digest="$(docker image inspect "$image" --format '{{index .RepoDigests 0}}' | sed 's/^.*@//')"
-            case "$digest" in sha256:*) ;; *) printf 'No repository digest: %s\n' "$instance_id"; break ;; esac
-            pinned_image="$(python - "$DATASET_PATH_FILE" "$instance_id" "$digest" <<'PY'
-          import json
-          import sys
-          with open(sys.argv[1], encoding="utf-8") as stream:
-              rows = [json.loads(line) for line in stream if line.strip()]
-          row = next(row for row in rows if row["instance_id"] == sys.argv[2])
-          repository = row["docker_image"].split("@", 1)[0].rsplit(":", 1)[0]
-          print(f"{repository}@{sys.argv[3]}")
-          PY
-          )"
-            python ../tools/fd2/prepare_frozen.py --pin-image "$DATASET_PATH_FILE" "$instance_id" "$digest"
-            digests="[\"${pinned_image}\"]"
-            image_size="$(docker image inspect "$pinned_image" --format '{{.Size}}')"
-            image_id="$(docker image inspect "$pinned_image" --format '{{.Id}}')"
-            # Remove by image ID so the original tag and the pinned digest both go
-            # (docs.docker.com/reference/cli/docker/image/rm: an image referenced by
-            # several names needs -f with its ID). Explicit checks; never prune.
-            cleanup() {
-              local containers
-              containers="$(docker ps -aq --filter "name=^git-launch-${instance_id}-")" || return 1
-              if [ -n "$containers" ]; then
-                docker rm -f $containers > /dev/null || return 1
-              fi
-              docker image rm -f "$image_id" > /dev/null || return 1
-              if docker image inspect "$image_id" > /dev/null 2>&1; then
-                return 1
-              fi
-            }
-            for run in 1 2 3; do
-              output="$OUTPUT/$split/run-$run"
-              before="$(df -B1 / | awk 'NR == 2 {print $4}')"
-              df -h /
-              started="$(date +%s)"
-              if python -m evaluation.evaluation \
-                --dataset "$DATASET_PATH_FILE" \
-                --split "$split" \
-                --platform linux \
-                --patch_dir gold \
-                --output_dir "$output" \
-                --workers 1 \
-                --overwrite 0 \
-                --instance_ids "$instance_id" \
-                > "../smoke/harness-logs/${split}-run-${run}.log" 2>&1; then
-                command_status=0
-              else
-                command_status=$?
-              fi
-              wall_seconds=$(( $(date +%s) - started ))
-              after="$(df -B1 / | awk 'NR == 2 {print $4}')"
-              df -h /
-              resolved="$(python - "$output/$instance_id/report.json" <<'PY'
-          import json
-          import sys
-          try:
-              with open(sys.argv[1], encoding="utf-8") as stream:
-                  report = json.load(stream)
-          except (OSError, ValueError):
-              print("false")
-          else:
-              print("true" if report.get("resolved") is True else "false")
-          PY
-          )"
-              digests="[\"${pinned_image}\"]"
-              python - "$ROWS" "$instance_id" "$split" "$run" "$resolved" "$wall_seconds" \
-                "$command_status" "$before" "$after" "$digests" "$image_size" <<'PY'
-          import json
-          import sys
-          row = {
-              "instance_id": sys.argv[2], "split": sys.argv[3], "run": int(sys.argv[4]),
-              "resolved": sys.argv[5] == "true", "wall_seconds": int(sys.argv[6]),
-              "command_status": int(sys.argv[7]),
-              "disk_free_bytes_before": int(sys.argv[8]),
-              "disk_free_bytes_after": int(sys.argv[9]),
-              "image_digests": json.loads(sys.argv[10]),
-              "image_size_bytes": int(sys.argv[11]) if sys.argv[11] else None,
-          }
-          with open(sys.argv[1], "a", encoding="utf-8") as stream:
-              stream.write(json.dumps(row, sort_keys=True) + "\n")
-          PY
-            done
-            if ! cleanup; then
-              printf 'Exact instance cleanup failed; stopping: %s\n' "$instance_id"
-              break
-            fi
-          done < <(python - "$SELECTION" <<'PY'
-          import json
-          import sys
-          with open(sys.argv[1], encoding="utf-8") as stream:
-              selection = json.load(stream)
-          for row in selection["instances"]:
-              print(row["instance_id"], row["split"], row["docker_image"], sep="\t")
-          PY
-          )
-          python - "$ROWS" <<'PY'
-          import json
-          import sys
-          with open(sys.argv[1], encoding="utf-8") as stream:
-              runs = [json.loads(line) for line in stream if line.strip()]
-          instances = []
-          for key in dict.fromkeys((row["instance_id"], row["split"]) for row in runs):
-              matching = [row for row in runs if (row["instance_id"], row["split"]) == key]
-              instances.append({"instance_id": key[0], "split": key[1], "runs": matching})
-          with open("../smoke/summary.json", "w", encoding="utf-8") as stream:
-              json.dump({"instances": instances}, stream, indent=2, sort_keys=True)
-              stream.write("\n")
-          PY
+          tools/fd2/gold_smoke.sh \
+            --harness-dir SWE-bench-Live \
+            --frozen-jsonl smoke/frozen.jsonl \
+            --selection smoke/selection.json \
+            --output-dir smoke/output
       - name: Report smoke outcome
         if: always()
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
-          path = Path("smoke/summary.json")
+          path = Path("smoke/output/summary.json")
           instances = json.loads(path.read_text(encoding="utf-8"))["instances"] if path.exists() else []
           passed = (len(instances) == 8 and all(len(item["runs"]) == 3 and
                     all(run["resolved"] for run in item["runs"]) for item in instances))
@@ -185,5 +67,5 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fd2-gold-smoke-summary
-          path: smoke/summary.json
+          path: smoke/output/summary.json
           if-no-files-found: error

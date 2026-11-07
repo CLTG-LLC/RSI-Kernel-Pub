@@ -37,3 +37,32 @@ Local metadata-only selection (no Docker or evaluation):
 Local selection test:
 
   uv run pytest -q tests/test_fd2_select_smoke.py
+
+Local evaluation uses the same driver as the workflow. First check out and
+install the pinned harness, and prepare frozen.jsonl and selection.json as
+above. Then run:
+
+  tools/fd2/gold_smoke.sh \
+    --harness-dir /path/to/SWE-bench-Live \
+    --frozen-jsonl smoke/frozen.jsonl \
+    --selection smoke/selection.json \
+    --output-dir smoke/output
+
+The optional DOCKER_CONTEXT environment variable selects a named Docker CLI
+context without changing the default context. Every Docker CLI call receives
+that context. The harness also uses the Docker Python SDK, which reads
+DOCKER_HOST rather than the CLI context, so the driver resolves the named
+context's endpoint with `docker context inspect` and exports DOCKER_HOST only
+to its child processes. Docker context documentation:
+https://docs.docker.com/engine/manage-resources/contexts/
+
+  DOCKER_CONTEXT=my-context tools/fd2/gold_smoke.sh \
+    --harness-dir /path/to/SWE-bench-Live \
+    --frozen-jsonl smoke/frozen.jsonl \
+    --selection smoke/selection.json \
+    --output-dir smoke/output
+
+The content-free summary.json includes the Docker server OS/architecture and
+context name. Fake-Docker regression test (no Docker daemon or real harness):
+
+  bash tests/fd2/test_gold_smoke.sh
