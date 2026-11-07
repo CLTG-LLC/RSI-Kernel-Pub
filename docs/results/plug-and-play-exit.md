@@ -7,7 +7,7 @@ Three claims are kept separate throughout:
 | Claim | Status in this report |
 |---|---|
 | Capability demonstrated (the kernel runs a campaign and an approval-gated accept through the plug-in surfaces) | criteria 1, 2, 5, 6, 7 below |
-| Continuation demonstrated (the same kernel bytes close campaigns on further tiers) | "continuation tested" in S4b (`docs/results/s4b-continuation.md`), which is a factual status, not a demonstrated claim; the cross-tier claim stays pending, criterion 3 |
+| Continuation demonstrated (the same kernel bytes close campaigns on further tiers) | demonstrated for the skill, harness-code and memory tiers: kernel-only hash `8ea2ae0a…e2bc` at S4b, E1c and S5c, each campaign closed (§3); "close" means a terminal outcome, not a retained update; context and tool-routing tiers untested |
 | Retained second update demonstrated (a ratchet from an approved champion, parent → child) | not demonstrated (S4b: no second retained update), §4 |
 
 ## 1. Wheel in a clean venv, campaign plus accept from the console entry, no checkout present
@@ -71,10 +71,22 @@ The mismatched approval is rejected as `not_updated` with exit code 0. Stdout co
 
 ## 3. Same kernel bytes close campaigns on skill, memory and harness-code tiers
 
-Pending (E1c running). Context and tool routing tiers: untested.
+Kernel identity is `_code_hash(exclude=('adapters',))`, recomputed for this report inside each run's pinned checkout (`pilot-code-<sha>`) with `uv run --offline python -c "from rsi_kernel.adapters.gdpevo.pilot import _code_hash; print(_code_hash(exclude=('adapters',)))"`. "Close" means the campaign reached a terminal state with an outcome; it does not require that an update was retained.
 
-- Skill tier: S4 closed `updated` for `task_group_001` and `task_group_003` on the owner's hash-bound approval, and `no_improvement` for `task_group_002` (`docs/results/gdpevo-pilot.md`).
-- Memory tier: S5b closed `updated` for `task_group_001`, `no_improvement` for `task_group_002`, and an operational STOP for `task_group_003` (`docs/results/e1a-s5b-evaluate-first.md`).
+| Tier | Run, pinned commit | Kernel-only hash | Closed with | Report |
+|---|---|---|---|---|
+| Skill | S4b, `16ac7fe7d110623ae7a990d6e96a235aca516c97` | `8ea2ae0a9f644815adb79dab1c883efa17e03396df6785c8b4e930f346e1a2bc` | `failed_gate` in both groups (`task_group_001`, `task_group_003`) | `docs/results/s4b-continuation.md` |
+| Harness code | E1c, `126ba9000d524d053a999c0287b968f0e3d26916` | `8ea2ae0a9f644815adb79dab1c883efa17e03396df6785c8b4e930f346e1a2bc` | `updated` for `task_group_001` and `task_group_003`; `no_improvement` for `task_group_002` | `docs/results/e1c-harness-code.md` |
+| Memory | S5c, `e7087c144033e0468cce1081c2d690739717c2ca` | `8ea2ae0a9f644815adb79dab1c883efa17e03396df6785c8b4e930f346e1a2bc` | `failed_gate` for `task_group_001` (`acceptance.json`; `campaign.json` status `closed`) | `docs/results/s5c-memory-continuation.md` |
+
+The three hashes are byte-identical, so the same kernel bytes closed campaigns on the skill, memory and harness-code tiers. Only E1c retained updates; the S4b and S5c closures kept the champion. Context and tool-routing tiers: untested.
+
+Earlier tier results, on different kernel bytes (context only, not counted toward this criterion):
+
+- Skill tier: S4 closed `updated` for `task_group_001` and `task_group_003` on the owner's hash-bound approval, and `no_improvement` for `task_group_002` (`docs/results/gdpevo-pilot.md`); its recorded kernel-only hash `e8d7b2b5…c4d209` differs.
+- Memory tier: S5b closed `updated` for `task_group_001`, `no_improvement` for `task_group_002`, and an operational STOP for `task_group_003` (`docs/results/e1a-s5b-evaluate-first.md`); kernel-only hash `2781ad32…99f3e8` differs.
+
+The H1a, H1b and H1c configuration-artifact experiments on the real host (`docs/results/h1a-rule-pack.md`, `docs/results/h1b-rule-pack.md`, `docs/results/h1c-tenant-rules.md`) are a separate line and are not counted here.
 
 ## 4. One ratchet from an approved champion
 
@@ -90,6 +102,8 @@ Measured by S4b (`docs/results/s4b-continuation.md`, issue #48) at that run's pi
 | Approval and `apply(hash)` | none: no approval was requested, so nothing was approved or applied |
 
 Criterion 4 has two halves, reported separately: the campaign started from an approved champion with the lineage recorded, and no second update was retained. The dev selection was a tie in `task_group_001` (paired dev delta 0.000000) and +0.013072 in `task_group_003`; the holdout split moved +0.016604 overall (report-only, not a gate) and did not change the outcome. Keeping the champion is not counted as success.
+
+S5c (memory tier, `docs/results/s5c-memory-continuation.md`) also produced no retained second update (`task_group_001` `failed_gate`); E1d (harness code) is running.
 
 ## 5. E0 denial tests and T3 checks green
 
@@ -167,7 +181,7 @@ Steps 1–4 sum to 4.94 s.
 
 ## Not covered
 
-- Criterion 3 (pending the E1c run); the memory and skill tiers are cited from their merged reports in that section.
+- Criterion 3 covers the skill, memory and harness-code tiers only; the context and tool-routing tiers are untested, and only E1c retained updates.
 - Criterion 4 does not demonstrate a retained second update: S4b recorded the lineage and ended `failed_gate` in both groups, so no second approval, `apply(hash)` or champion change exists from it.
 - Toy keyword task on loopback only; says nothing about evaluation quality or real hosts.
 - Single runs; no repeat timings.
