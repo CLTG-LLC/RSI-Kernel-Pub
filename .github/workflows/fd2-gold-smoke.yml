@@ -11,6 +11,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
+      # Standard runners have about 14 GB free; a first dispatch hit "No space left on device".
+      # Remove large preinstalled toolchains this job never uses, as the common
+      # free-disk-space actions do (e.g. github.com/jlumbroso/free-disk-space). Done inline,
+      # so no new third-party action; Docker images are untouched; no prune.
+      - name: Free runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Check out the pinned harness
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
