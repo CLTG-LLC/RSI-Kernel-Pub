@@ -1,7 +1,7 @@
 """Lead-run pre-run health check for one registered group (E2 prereg §3 STOP 3, issue #113).
 
 Reuses DockerSolver's own staging, image build and environment start/check (Docker
-health ``healthy``, ``/health`` answers, judge POST returns 404 with
+health ``healthy``, the group's own health route answers, judge POST returns 404 with
 ``TASK_ENV_ENABLE_JUDGE=0``). No solve and no grading run; nothing staged is printed.
 
     python -m rsi_kernel.adapters.gdpevo.health --root ROOT --group G --evidence-dir DIR
@@ -41,7 +41,8 @@ def check(root: Path, group: str, evidence_dir: Path) -> dict:
         phase = "images"
         solver_image, task_image = solver._images(out, group_dir, scope)
         phase = "environment"
-        solver._environment(out, scope, solver_image, task_image, sd._environment_port(group))
+        solver._environment(out, scope, solver_image, task_image, sd._environment_port(group),
+                            sd._health_path((group_dir / "env/endpoints.txt").read_text(encoding="utf-8")))
         checked = json.loads((out / "environment-check.json").read_text())
         phase = "cleanup"
         solver._run(["docker", "rm", "-f", *[scope + s for s in ("-check", "-env", "-fwd")]])

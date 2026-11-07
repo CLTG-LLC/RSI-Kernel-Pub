@@ -70,15 +70,17 @@ http {
 # Upstream workflow.md §2 only requires the health endpoint to answer; each group
 # returns its own JSON (group 003: {"ok": true}), so the body is recorded as-is
 # (JSON when it parses, else replacement-decoded text; encoding is never a gate).
-# Redirects are not followed, so health must itself be 2xx and judge itself 404;
-# same no-redirect handler as decision/backends.py. urlopen raises HTTPError on
-# any non-2xx. https://docs.python.org/3/library/urllib.request.html
+# The route is per group (guide environment_and_data.md:157) and substituted as
+# HEALTH_PATH. Redirects are not followed, so health must itself be 2xx and judge
+# itself 404; same no-redirect handler as decision/backends.py. urlopen raises
+# HTTPError on any non-2xx.
+# https://docs.python.org/3/library/urllib.request.html
 ENVIRONMENT_CHECK = '''import json,urllib.request,urllib.error
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl): return None
 opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect())
 base="http://task-env:PORT"
-raw=opener.open(base+"/health").read()
+raw=opener.open(base+"HEALTH_PATH").read()
 try: health=json.loads(raw)
 except ValueError: health=raw.decode("utf-8","replace")
 request=urllib.request.Request(base+"/api/judge",data=b"{}",headers={"Content-Type":"application/json"},method="POST")
@@ -152,10 +154,23 @@ def _environment_port(group: str) -> int:
     return 9000 + int(match.group(1))
 
 
+def _health_path(endpoints: str) -> str:
+    # Upstream guide environment_and_data.md:28–29,157: the health route is
+    # orchestration-only and documented per environment, so the group's own
+    # staged endpoints.txt decides it. /health wins when a group serves both.
+    routes = {" ".join(line.split()) for line in endpoints.splitlines()}
+    if "GET /health" in routes:
+        return "/health"
+    if "GET /api/health" in routes:
+        return "/api/health"
+    raise _Stop("env_health_path")
+
+
 def _access_note(group: str, endpoints: str) -> str:
     # Upstream workflow.md §2: base URL, required credentials, then one
-    # "METHOD /path" line per allowed endpoint; /health is never listed and
-    # /api/judge exists only for reflect-skill generation, so both are omitted.
+    # "METHOD /path" line per allowed endpoint; health is orchestration-only
+    # (guide environment_and_data.md:28–29), so neither health route is listed,
+    # and /api/judge exists only for reflect-skill generation, so it is omitted.
     port = _environment_port(group)
     lines = []
     for line in endpoints.splitlines():
@@ -170,7 +185,7 @@ def _access_note(group: str, endpoints: str) -> str:
         if method != "GET":
             # No group has a non-judge POST; render none rather than guess a contract.
             raise _Stop("env_endpoint")
-        if path != "/health":
+        if path not in ("/health", "/api/health"):
             lines.append(f"{method} {path}")
     return "\n".join([
         f"Environment base URL: http://task-env:{port}/",
@@ -246,7 +261,8 @@ class DockerSolver:
             if score_from_evaluator(sanity) != 0 or "error" in sanity:
                 raise _Stop("grader_sanity")
             phase = "environment"
-            self._environment(out, scope, solver_image, task_image, _environment_port(task.group))
+            self._environment(out, scope, solver_image, task_image, _environment_port(task.group),
+                              _health_path((group / "env/endpoints.txt").read_text(encoding="utf-8")))
             phase = "solver"
             self._solve(out, scope, solver_image)
             phase = "trace"
@@ -472,7 +488,7 @@ class DockerSolver:
             raise _Stop("grader_json")
         return payload
 
-    def _environment(self, out, scope, solver_image, task_image, port):
+    def _environment(self, out, scope, solver_image, task_image, port, health_path):
         network = scope + "-net"
         # Coordinator addition: Docker-native egress boundary; no host firewall.
         # https://docs.docker.com/reference/cli/docker/network/create/#internal
@@ -481,7 +497,7 @@ class DockerSolver:
         self._run(["docker", "run", "-d", "--name", scope + "-env", "--network", network,
                    "--network-alias", "task-env", "-e", "TASK_ENV_BIND=0.0.0.0", "-e", f"TASK_ENV_PORT={port}",
                    "-e", "TASK_ENV_ENABLE_JUDGE=0", "--health-cmd",
-                   f'python3 -c "import urllib.request;urllib.request.urlopen(\\"http://127.0.0.1:{port}/health\\")"',
+                   f'python3 -c "import urllib.request;urllib.request.urlopen(\\"http://127.0.0.1:{port}{health_path}\\")"',
                    task_image], out / "env-id.txt")
         deadline = time.monotonic() + self.timeout
         while True:
@@ -496,7 +512,9 @@ class DockerSolver:
                 raise _Stop("environment_timeout")
             time.sleep(1)  # reference recipe, local state poll; no health-budget invention.
         self._run(["docker", "run", "--name", scope + "-check", "--network", network,
-                   solver_image, "python3", "-c", ENVIRONMENT_CHECK.replace("PORT", str(port))], out / "environment-check.json")
+                   solver_image, "python3", "-c",
+                   ENVIRONMENT_CHECK.replace("PORT", str(port)).replace("HEALTH_PATH", health_path)],
+                  out / "environment-check.json")
         checked = json.loads((out / "environment-check.json").read_text())
         # Upstream only requires the health endpoint to answer; the body is any JSON.
         if not isinstance(checked, dict) or "health" not in checked or checked.get("judge_http_status") != 404:

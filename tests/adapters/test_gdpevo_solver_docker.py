@@ -14,6 +14,9 @@ from rsi_kernel.adapters.gdpevo.tasks import FrozenTask
 
 GROUP_001_ENDPOINTS = "GET /health\nGET /api/manifest\nGET /api/events\nPOST /api/judge\n"
 GROUP_002_ENDPOINTS = "GET /health\nGET /api/customers\nGET /api/quotes\nPOST /api/judge\n"
+# Groups 004/008 serve only the nested health route; group 005 serves both.
+GROUP_004_ENDPOINTS = "GET /api/health\nGET /api/items\nPOST /api/judge\n"
+BOTH_HEALTH_ENDPOINTS = "GET /health\nGET /api/health\nGET /api/items\nPOST /api/judge\n"
 BOTH_GROUPS = {"task_group_001": GROUP_001_ENDPOINTS, "task_group_002": GROUP_002_ENDPOINTS}
 
 
@@ -696,7 +699,7 @@ def test_fix_malformed_context_endpoint_stops_before_builds(docker_solver, monke
     assert not any("build" in a or "run" in a for a, _ in fake.calls)
 
 
-def _run_environment_check(mod, health, judge):
+def _run_environment_check(mod, health, judge, path="/health"):
     # Executes the real ENVIRONMENT_CHECK script against a local synthetic server.
     import http.server, subprocess, sys, threading
 
@@ -710,7 +713,7 @@ def _run_environment_check(mod, health, judge):
             self.wfile.write(body)
 
         def do_GET(self):
-            self._reply(health if self.path == "/health" else (200, b'{"ok": true}', None))
+            self._reply(health if self.path == path else (200, b'{"ok": true}', None))
 
         def do_POST(self):
             self.rfile.read(int(self.headers.get("Content-Length", 0)))
@@ -722,10 +725,70 @@ def _run_environment_check(mod, health, judge):
     server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        script = mod.ENVIRONMENT_CHECK.replace("http://task-env:PORT", f"http://127.0.0.1:{server.server_port}")
+        script = mod.ENVIRONMENT_CHECK.replace(
+            "http://task-env:PORT", f"http://127.0.0.1:{server.server_port}").replace("HEALTH_PATH", path)
         return subprocess.run([sys.executable, "-c", script], capture_output=True, timeout=30)
     finally:
         server.shutdown()
+
+
+def test_environment_check_script_uses_the_group_health_route():
+    # Upstream guide: the health endpoint is documented per environment.
+    from rsi_kernel.adapters.gdpevo import solver_docker as mod
+    path = mod._health_path(GROUP_004_ENDPOINTS)
+    ok = _run_environment_check(mod, (200, b'{"ok": true}', None), (404, b"", None), path=path)
+    assert ok.returncode == 0 and json.loads(ok.stdout)["health"] == {"ok": True}
+    # The derived route is the one probed: a failing /api/health fails the check.
+    assert _run_environment_check(mod, (503, b"", None), (404, b"", None), path=path).returncode != 0
+
+
+@pytest.mark.parametrize("endpoints,expected", [
+    (GROUP_001_ENDPOINTS, "/health"),
+    (GROUP_004_ENDPOINTS, "/api/health"),
+    (BOTH_HEALTH_ENDPOINTS, "/health"),
+])
+def test_health_path_comes_from_the_group_endpoints(endpoints, expected):
+    from rsi_kernel.adapters.gdpevo import solver_docker as mod
+    assert mod._health_path(endpoints) == expected
+
+
+def test_health_path_absent_is_a_stop():
+    from rsi_kernel.adapters.gdpevo import solver_docker as mod
+    with pytest.raises(mod._Stop) as error:
+        mod._health_path("GET /api/items\nPOST /api/judge\n")
+    assert error.value.reason == "env_health_path"
+
+
+def test_access_note_health_only_group_is_byte_identical():
+    from rsi_kernel.adapters.gdpevo import solver_docker as mod
+    assert mod._access_note("task_group_001", GROUP_001_ENDPOINTS) == (
+        "Environment base URL: http://task-env:9001/\n"
+        "No credentials are required.\n"
+        "Allowed GET endpoints:\n"
+        "GET /api/manifest\n"
+        "GET /api/events\n"
+        "Use this base URL instead of any localhost URL in the task inputs.\n")
+
+
+def test_access_note_omits_both_health_routes():
+    from rsi_kernel.adapters.gdpevo import solver_docker as mod
+    note = mod._access_note("task_group_005", BOTH_HEALTH_ENDPOINTS)
+    assert "/health" not in note and "/api/health" not in note
+    assert "GET /api/items" in note and "/api/judge" not in note
+
+
+def test_per_group_health_route_reaches_healthcheck_and_check_script(build_solver):
+    # Groups 004/008 serve only /api/health; the Docker healthcheck must use it.
+    fixture = build_solver({"task_group_004": GROUP_004_ENDPOINTS})
+    _, _, fake, _, _ = fixture
+    assert solve(fixture, item_id="task_group_004/train/001")["score"] == 1
+    env = next(a for a, _ in fake.calls if "TASK_ENV_ENABLE_JUDGE=0" in a)
+    assert "127.0.0.1:9004/api/health" in " ".join(env)
+    assert "127.0.0.1:9004/health" not in " ".join(env)
+    check = next(a for a, _ in fake.calls if "python3" in a and a[:2] == ["docker", "run"])
+    assert 'base="http://task-env:9004"' in check[-1] and 'base+"/api/health"' in check[-1]
+    note = (fake.attempt() / "work/environment_access.md").read_text()
+    assert "GET /api/items" in note and "health" not in note
 
 
 def test_environment_check_script_contract():

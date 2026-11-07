@@ -8,7 +8,7 @@ Three claims are kept separate throughout:
 |---|---|
 | Capability demonstrated (the kernel runs a campaign and an approval-gated accept through the plug-in surfaces) | criteria 1, 2, 5, 6, 7 below |
 | Continuation demonstrated (the same kernel bytes close campaigns on further tiers) | demonstrated for the skill, harness-code and memory tiers: kernel-only hash `8ea2ae0a…e1a2bc` at S4b, E1c and S5c, each campaign closed (§3); "close" means a terminal outcome, not a retained update; context and tool-routing tiers untested |
-| Retained second update demonstrated (a ratchet from an approved champion, parent → child) | not demonstrated (S4b: no second retained update), §4 |
+| Retained second update demonstrated (a ratchet from an approved champion, parent → child) | **not demonstrated**: every continuation attempt closed without a second retained update (§4) |
 
 ## 1. Wheel in a clean venv, campaign plus accept from the console entry, no checkout present
 
@@ -90,7 +90,9 @@ The H1a, H1b and H1c configuration-artifact experiments on the real host (`docs/
 
 ## 4. One ratchet from an approved champion
 
-Measured by S4b (`docs/results/s4b-continuation.md`, issue #48) at that run's pinned commit `16ac7fe7d110623ae7a990d6e96a235aca516c97`, under the frozen pre-registration `docs/prereg-gdpevo-pilot.md` as amended by `docs/prereg-s4b-addendum.md`. S4b ran one campaign per paired group from that group's approved S4 champion, loaded through the existing hash-checked loader; `task_group_002` has no approved champion (S4 closed it `no_improvement`) and is excluded.
+**Status: not demonstrated.** Each campaign started from that group's approved champion with the parent → child lineage recorded, and none produced a second retained update. Four group-campaigns closed `failed_gate` at the zero-margin adjudication gate — S4b `task_group_001` and `task_group_003` (−0.027778 each), S5c `task_group_001` (−0.051282) and E1d `task_group_001` (−0.025641) — and E1d `task_group_003` closed `no_improvement` at optimise with no candidate, so it ran no final phase. No approval request was written by any of them.
+
+The measurements below are by S4b (`docs/results/s4b-continuation.md`, issue #48) at that run's pinned commit `16ac7fe7d110623ae7a990d6e96a235aca516c97`, under the frozen pre-registration `docs/prereg-gdpevo-pilot.md` as amended by `docs/prereg-s4b-addendum.md`. S4b ran one campaign per paired group from that group's approved S4 champion, loaded through the existing hash-checked loader; `task_group_002` has no approved champion (S4 closed it `no_improvement`) and is excluded.
 
 | Observation | Value |
 |---|---|
@@ -103,7 +105,9 @@ Measured by S4b (`docs/results/s4b-continuation.md`, issue #48) at that run's pi
 
 Criterion 4 has two halves, reported separately: the campaign started from an approved champion with the lineage recorded, and no second update was retained. The dev selection was a tie in `task_group_001` (paired dev delta 0.000000) and +0.013072 in `task_group_003`; the holdout split moved +0.016604 overall (report-only, not a gate) and did not change the outcome. Keeping the champion is not counted as success.
 
-S5c (memory tier, `docs/results/s5c-memory-continuation.md`) also produced no retained second update (`task_group_001` `failed_gate`); E1d (harness code) is running.
+S5c (memory tier, `docs/results/s5c-memory-continuation.md`) also produced no retained second update (`task_group_001` `failed_gate`, adjudication retention not met at −0.051282). E1d (harness code, `docs/results/e1d-harness-code-ratchet.md`) has finished: `task_group_001` closed `failed_gate` off the approved E1c champion (champion `0.6153845`, candidate `0.5897435`, Δ −0.025641 against the zero margin; holdout Δ −0.001786, report-only), and `task_group_003` closed `no_improvement` at optimise with no candidate, so it ran no final phase.
+
+Across the three continuation campaigns that reached a final phase — S4b (skill tier, two groups), S5c (memory, one group) and E1d (harness code, one group) — all four group-campaigns closed `failed_gate` at the same zero-margin adjudication gate, and none wrote an approval request. The lineage half of this criterion is demonstrated; the retention half is not.
 
 ## 5. E0 denial tests and T3 checks green
 
@@ -182,6 +186,6 @@ Steps 1–4 sum to 4.94 s.
 ## Not covered
 
 - Criterion 3 covers the skill, memory and harness-code tiers only; the context and tool-routing tiers are untested, and only E1c retained updates.
-- Criterion 4 does not demonstrate a retained second update: S4b recorded the lineage and ended `failed_gate` in both groups, so no second approval, `apply(hash)` or champion change exists from it.
+- Criterion 4 does not demonstrate a retained second update: every continuation campaign recorded the lineage and closed without one — S4b and S5c `failed_gate`, and E1d `failed_gate` for `task_group_001` with `task_group_003` `no_improvement` at optimise — so no second approval, `apply(hash)` or champion change exists from any of them.
 - Toy keyword task on loopback only; says nothing about evaluation quality or real hosts.
 - Single runs; no repeat timings.
