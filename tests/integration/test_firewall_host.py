@@ -38,6 +38,45 @@ import java.util.regex.Pattern;
 public final class SyntheticCatalog {
     public static List<String> defaults() { return List.of("synthetic-marker"); }
     public record Rule(Predicate<String> matcher) { }
+    public record TenantDocument(List<String> rules) { }
+    public record TenantView(List<Rule> tenantRules) { }
+    public static final class AdmissionException extends RuntimeException { }
+    public static Optional<TenantDocument> parseTenant(String yaml) {
+        String prefix = "synthetic_policy:\\n  rules:\\n", suffix = "  end: frozen\\n";
+        if (!yaml.startsWith(prefix) || !yaml.endsWith(suffix))
+            throw new IllegalArgumentException("envelope changed");
+        String list = yaml.substring(prefix.length(), yaml.length() - suffix.length());
+        if (list.equals("    PARSE_EMPTY\\n")) return Optional.empty();
+        if (list.equals("    PARSE_FAULT\\n")) throw new IllegalStateException("parser fault");
+        // Deliberately permissive: unknown/dedented keys and comments are ignored,
+        // and missing LF or tab indentation can still compile. The HOST must contain the list.
+        return Optional.of(new TenantDocument(list.lines()
+                .filter(line -> line.stripLeading().startsWith("- "))
+                .map(line -> line.stripLeading().substring("- ".length())).toList()));
+    }
+    public static final class TenantCompiler {
+        public TenantView compile(TenantDocument document) {
+            List<String> expressions = document.rules();
+            if (expressions.contains("COMPILE_FAULT"))
+                throw new IllegalStateException("operational", new NullPointerException());
+            if (expressions.contains("BARE_ADMISSION")) throw new AdmissionException();
+            if (expressions.contains("OTHER_CAUSE"))
+                throw new IllegalStateException("operational", new IllegalArgumentException());
+            // Synthetic admission boundary: the valid fixture has one rule.
+            if (new HashSet<>(expressions).size() != expressions.size() || expressions.size() > 1)
+                throw new IllegalStateException("admission", new AdmissionException());
+            return new TenantView(expressions.stream().map(expression -> {
+                if (expression.equals("PREDICATE_FAULT"))
+                    return new Rule(s -> { throw new IllegalStateException("predicate fault"); });
+                try {
+                    Pattern pattern = Pattern.compile(expression);
+                    return new Rule(s -> pattern.matcher(s).find());
+                } catch (java.util.regex.PatternSyntaxException ex) {
+                    throw new IllegalStateException("admission", new AdmissionException());
+                }
+            }).toList());
+        }
+    }
 }
 final class SyntheticLoader {
     static List<SyntheticCatalog.Rule> load(InputStream input, List<?> matchers) throws IOException {
@@ -87,6 +126,210 @@ def _candidate_body(data, ids=("d0", "d1", "d2")):
     candidate = Candidate({"rules.yml": data}, "application/yaml")
     return {"candidate_id": candidate.id, "item_ids": list(ids),
             "components": {"rules.yml": base64.b64encode(data).decode()}}
+
+
+@pytest.fixture
+def tenant_setup(tmp_path):
+    envelope = tmp_path / "tenant-envelope.yml"
+    envelope.write_bytes(b"synthetic_policy:\n  rules:\n# RSI_TENANT_RULES\n  end: frozen\n")
+    builtin = tmp_path / "builtins.yml"
+    builtin.write_bytes(CHAMPION)
+    return {"tenant_envelope_path": str(envelope), "tenant_parse": "SyntheticCatalog#parseTenant",
+            "tenant_compile": "SyntheticCatalog$TenantCompiler#compile",
+            "tenant_rules_accessor": "tenantRules",
+            "tenant_admission_exception": "SyntheticCatalog$AdmissionException",
+            "guard_resource_path": str(builtin)}
+
+
+TENANT_EMPTY = b"    []\n"
+TENANT_ALPHA = b"    - synthetic-alpha\n"
+
+
+def _response_bytes(url, body):
+    req = urllib.request.Request(url + "/evaluate", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=READY_TIMEOUT) as response:
+        return response.read()
+
+
+def test_tenant_empty_champion_preserves_builtin_response_bytes(firewall_host, tenant_setup):
+    before = _kernel_hashes()
+    base, base_log, _ = firewall_host()
+    tenant, tenant_log, champion_path = firewall_host(champion=TENANT_EMPTY, **tenant_setup)
+    builtin = Path(tenant_setup["guard_resource_path"])
+    champion = HttpHost(tenant).get_artifact()
+    assert champion.components == {"rules.yml": TENANT_EMPTY}
+    for ids in (("d2", "d0", "d1"), ("d0",), ("d1", "d1"), ()):
+        assert _response_bytes(tenant, _candidate_body(TENANT_EMPTY, ids)) == _response_bytes(
+            base, _candidate_body(CHAMPION, ids))
+    assert all(row == {"content_id": champion.id, "status": "ok", "reason_class": "none"}
+               for row in _log_rows(tenant_log))
+    assert len(_log_rows(tenant_log)) == len(_log_rows(base_log)) == 4
+    assert _request(tenant, "/apply", {"candidate_id": _candidate_body(TENANT_ALPHA)["candidate_id"]})[0] == 200
+    assert HttpHost(tenant).get_artifact().id == champion.id
+    assert champion_path.read_bytes() == TENANT_EMPTY and builtin.read_bytes() == CHAMPION
+    assert _kernel_hashes() == before
+
+
+@pytest.mark.parametrize("data,scores", [
+    (TENANT_EMPTY, [0, 0, 1]), (TENANT_ALPHA, [1, 0, 1]),
+    (b"    - synthetic-alpha \n", [0, 0, 1]),
+    (b"    - synthetic-ordinary\n", [0, 0, 0]),
+])
+def test_tenant_candidate_dependent_hits_misses_and_exact_identity(firewall_host, tenant_setup, data, scores):
+    url, log, _ = firewall_host(champion=TENANT_EMPTY, **tenant_setup)
+    body = _candidate_body(data)
+    status, reply = _request(url, "/evaluate", body)
+    assert status == 200
+    assert [row["score"] for row in reply["results"]] == scores
+    assert _log_rows(log) == [{"content_id": body["candidate_id"], "status": "ok", "reason_class": "none"}]
+    assert Path(tenant_setup["guard_resource_path"]).read_bytes() == CHAMPION
+
+
+@pytest.mark.parametrize("data", [
+    b"    - arbitrary: invalid\nschema_version: 3\n",
+    TENANT_ALPHA + b"  tool_result_scan: monitor\n",
+    TENANT_ALPHA.rstrip(b"\n"),
+    b"  \t  - synthetic-alpha\n",
+    b"# RSI_TENANT_RULES",  # A comment without LF can consume the trusted suffix.
+    b"    - x\xc2\x85  end: hacked\n",  # NEL
+    b"    - x\xe2\x80\xa8  end: hacked\n",  # U+2028
+    b"    - x\xe2\x80\xa9  end: hacked\n",  # U+2029
+], ids=["schema_version_escape", "sibling_key_escape", "missing_final_lf", "tab_indent", "marker_consumes_suffix",
+        "nel_line_break", "line_separator", "paragraph_separator"])
+def test_tenant_containment_rejects_before_permissive_parser(firewall_host, tenant_setup, data):
+    url, log, _ = firewall_host(champion=TENANT_EMPTY, **tenant_setup)
+    body = _candidate_body(data)
+    assert _request(url, "/evaluate", body) == (
+        500, {"error": "operational", "reason_class": "TenantContainment"})
+    assert _log_rows(log) == [{"content_id": body["candidate_id"], "status": "operational",
+                              "reason_class": "TenantContainment"}]
+
+
+def test_tenant_candidate_marker_comment_stays_harmless(firewall_host, tenant_setup):
+    url, log, _ = firewall_host(champion=TENANT_EMPTY, **tenant_setup)
+    data = b"# RSI_TENANT_RULES\n\n" + TENANT_ALPHA
+    assert _response_bytes(url, _candidate_body(data)) == _response_bytes(url, _candidate_body(TENANT_ALPHA))
+    assert _log_rows(log)[0]["content_id"] == _candidate_body(data)["candidate_id"]
+    assert _log_rows(log)[1]["content_id"] == _candidate_body(TENANT_ALPHA)["candidate_id"]
+
+
+@pytest.mark.parametrize("slot", ["", "  rules: []\n", "  - rules:\n", "\trules:\n", "  rules: value\n"])
+def test_tenant_containment_invalid_envelope_slot_refuses_start(firewall_host, tenant_setup, slot):
+    Path(tenant_setup["tenant_envelope_path"]).write_text(
+        "synthetic_policy:\n" + slot + "# RSI_TENANT_RULES\n  end: frozen\n", encoding="utf-8")
+    command = firewall_host(champion=TENANT_EMPTY, start=False, **tenant_setup)
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        try:
+            stdout, _ = proc.communicate(timeout=0.5)  # Existing invalid-config test precedent.
+        except subprocess.TimeoutExpired:
+            pytest.fail("invalid tenant slot configuration started the server")
+        assert proc.returncode != 0 and "LISTENING" not in stdout
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=READY_TIMEOUT)
+        proc.stdout.close()
+        proc.stderr.close()
+
+
+@pytest.mark.parametrize("data,code,reason", [
+    (b"    PARSE_EMPTY\n", 422, "TenantParseEmpty"),
+    (b"    - synthetic-alpha\n    - synthetic-beta\n", 422, "AdmissionException"),
+    (TENANT_ALPHA + TENANT_ALPHA, 422, "AdmissionException"),
+    (b"    - [\n", 422, "AdmissionException"),
+    (b"    PARSE_FAULT\n", 500, "IllegalStateException"),
+    (b"    - COMPILE_FAULT\n", 500, "IllegalStateException"),
+    (b"    - OTHER_CAUSE\n", 500, "IllegalStateException"),
+    (b"    - BARE_ADMISSION\n", 500, "AdmissionException"),
+    (b"    - PREDICATE_FAULT\n", 500, "IllegalStateException"),
+    (b"    - \xff\n", 500, "MalformedInputException"),
+])
+def test_tenant_only_documented_admission_failure_is_ineligible(firewall_host, tenant_setup, data, code, reason):
+    url, log, _ = firewall_host(champion=TENANT_EMPTY, **tenant_setup)
+    body = _candidate_body(data)
+    status = "ineligible" if code == 422 else "operational"
+    assert _request(url, "/evaluate", body) == (code, {"error": status, "reason_class": reason})
+    assert _log_rows(log) == [{"content_id": body["candidate_id"], "status": status, "reason_class": reason}]
+
+
+def _refuses_start(command):
+    result = subprocess.run(command, capture_output=True, text=True, timeout=READY_TIMEOUT)
+    assert result.returncode != 0
+    assert "LISTENING" not in result.stdout
+    return result
+
+
+@pytest.mark.parametrize("missing", ["tenant_envelope_path", "tenant_parse", "tenant_compile",
+                                    "tenant_rules_accessor", "tenant_admission_exception"])
+def test_tenant_partial_config_refuses_start(firewall_host, tenant_setup, missing):
+    config = {key: value for key, value in tenant_setup.items() if key != missing}
+    result = _refuses_start(firewall_host(champion=TENANT_EMPTY, start=False, **config))
+    assert f"missing {missing}" in result.stderr
+
+
+@pytest.mark.parametrize("data", [b"synthetic_policy:\n", b"# RSI_TENANT_RULES\n# RSI_TENANT_RULES\n",
+                                 b"  # RSI_TENANT_RULES\n"])
+def test_tenant_envelope_requires_one_exact_marker_line(firewall_host, tenant_setup, data):
+    Path(tenant_setup["tenant_envelope_path"]).write_bytes(data)
+    _refuses_start(firewall_host(champion=TENANT_EMPTY, start=False, **tenant_setup))
+
+
+def test_tenant_startup_guard_pass_runs_once_without_candidate_swap(firewall_host, tenant_setup, guard_setup):
+    config, resource, counter, seen = guard_setup
+    config = {**tenant_setup, **config}
+    original = resource.stat()
+    url, log, champion_path = firewall_host(champion=TENANT_EMPTY, **config)
+    assert counter.read_text() == "1" and seen.read_bytes() == CHAMPION
+    # Even a rule that would fail the resource-swap guard never replaces built-ins.
+    for data in (TENANT_EMPTY, TENANT_ALPHA, b"    - synthetic-reject\n", b"    PARSE_EMPTY\n"):
+        code = _request(url, "/evaluate", _candidate_body(data))[0]
+        assert code == (422 if data == b"    PARSE_EMPTY\n" else 200)
+        assert counter.read_text() == "1" and seen.read_bytes() == CHAMPION
+        assert resource.read_bytes() == CHAMPION and resource.stat().st_mtime_ns == original.st_mtime_ns
+        row = _log_rows(log)[-1]
+        assert row["guard_status"] == "passed" and row["skipped_tests"] == "unknown"
+        assert row["content_id"] == _candidate_body(data)["candidate_id"]
+    assert champion_path.read_bytes() == TENANT_EMPTY
+    bad = {**_candidate_body(TENANT_ALPHA), "candidate_id": "0" * 64}
+    assert _request(url, "/evaluate", bad)[0] == 400
+    assert _log_rows(log)[-1]["guard_status"] == "passed"
+    assert _log_rows(log)[-1]["content_id"] == _candidate_body(TENANT_ALPHA)["candidate_id"]
+    assert "synthetic-private" not in log.read_text()
+
+
+@pytest.mark.parametrize("failure", ["reject", "launch", "timeout"])
+def test_tenant_startup_guard_failure_refuses_start(firewall_host, tenant_setup, guard_setup, failure):
+    config, resource, counter, _ = guard_setup
+    if failure == "reject":
+        resource.write_bytes(CHAMPION + b"|synthetic-reject")
+    elif failure == "launch":
+        config = {**config, "guard_command": json.dumps([str(resource.parent / "missing")])}
+    else:
+        resource.write_bytes(CHAMPION + b"|synthetic-timeout")
+        config = {**config, "guard_timeout_seconds": 0.5}
+    before = resource.read_bytes()
+    result = _refuses_start(firewall_host(champion=TENANT_EMPTY, start=False, **{**tenant_setup, **config}))
+    expected_reason = "guard_failed" if failure == "reject" else "guard_unavailable"
+    assert expected_reason in result.stderr
+    assert resource.read_bytes() == before
+    if failure == "launch":
+        assert not counter.exists()
+    else:
+        assert counter.read_text() == "1"
+
+
+def test_tenant_golden_cases_check_builtins_not_composed_policy(firewall_host, tenant_setup):
+    golden = {**GUARDS, "g1": {"text": "synthetic-alpha", "expectation": "must_not_match"}}
+    url, _, _ = firewall_host(champion=TENANT_EMPTY, guards=golden, **tenant_setup)
+    status, reply = _request(url, "/evaluate", _candidate_body(TENANT_ALPHA))
+    assert status == 200 and reply["results"][0]["score"] == 1
+    bad_golden = {"g0": {"text": "synthetic-alpha", "expectation": "must_match"}}
+    result = _refuses_start(firewall_host(champion=TENANT_EMPTY, guards=bad_golden,
+                                        start=False, **tenant_setup))
+    assert "GoldenGuardFailure" in result.stderr
 
 
 def test_offline_host_implementation_exists():

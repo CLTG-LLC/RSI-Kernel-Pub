@@ -133,6 +133,80 @@ a trustworthy skipped-test count. Without a command configured, evaluation and
 evidence retain their existing behavior. The command guard supplements rather
 than replaces the native loader and golden-case checks.
 
+## Tenant-rule mode
+
+Opt in with **all five** tenant keys; partial or blank configuration refuses
+startup. Without them the existing pack evaluator is unchanged.
+
+```properties
+tenant_envelope_path=tenant-envelope.yml
+tenant_parse=example.PolicyYaml#read
+tenant_compile=example.TenantCompiler#compile
+tenant_rules_accessor=customRules
+tenant_admission_exception=example.PolicyAdmissionException
+# Required even without guard_command: the unchanged built-in resource.
+guard_resource_path=offline-copy/resources/rules.yml
+# The startup champion is now a tenant rule list, e.g. an empty list.
+champion_path=empty-tenant-rules.yml
+```
+
+The frozen YAML envelope must contain **one exact, unindented, LF-terminated
+marker line** `# RSI_TENANT_RULES`. Startup validates that the preceding nonblank,
+noncomment line is an empty block-list mapping key using spaces for indentation,
+and the following nonblank, noncomment envelope line (if any) is no deeper than
+that key. Candidate UTF-8 bytes replace the marker line verbatim: no indentation,
+escaping, newline insertion or reserialization. **Before concatenation**, every
+nonblank, noncomment candidate line must be indented strictly deeper than the
+slot's mapping key; tabs in indentation are rejected, and candidates must end
+with LF so they cannot consume the frozen suffix. Candidates containing NEL
+(U+0085), LINE SEPARATOR (U+2028) or PARAGRAPH SEPARATOR (U+2029) are rejected,
+because YAML 1.1 parsers treat them as line breaks. Blank lines and comment lines,
+including a candidate marker comment, are harmless and are not substituted again.
+For an envelope ending in `rules:` then the marker, an empty list can be `  []`
+plus LF.
+The marker is a **named local envelope convention**, not a YAML standard: literal
+substitution extends the existing host's exact-byte loader pattern without a YAML
+dependency. Synthetic tests verify frozen prefix/suffix preservation and
+candidate-dependent scores; the public parser owns the schema and whole-list
+validation.
+
+All tenant classes and members must be public. The parser is **static
+`method(String)` → `Optional`**; the compiler has a **public zero-argument
+constructor** and one unambiguous **instance method taking one document**.
+Its public view exposes the configured zero-argument accessor returning `List`;
+public rules expose `matcher()` → `Predicate<String>`. Tenant reflection uses
+public lookup and invocation only, never `setAccessible`; the existing built-in
+loader's offline private-API seam is unchanged.
+
+The single candidate component and fixed champion are tenant **lists**, not packs
+or full documents. At startup the existing loader reads `guard_resource_path`
+once; scoring uses **built-in predicates OR compiled tenant predicates**, with
+unchanged ordered `must_match` / `must_not_match` responses. Identity and JSONL
+format remain unchanged: hashes cover actual decoded **candidate list bytes**,
+not the envelope. Apply stays record-only. Prompt/context, policy publication,
+posture pipeline and full runtime budget enforcement remain untested.
+
+* **422 `ineligible`**: parser returns `Optional.empty` (`TenantParseEmpty`), or
+  compiler invocation throws `IllegalStateException` whose **direct cause's exact
+  class** is `tenant_admission_exception` (that class's simple name).
+* **500 `operational`**: containment violations (`TenantContainment`) and every
+  other tenant parse, reflection, compilation, accessor or predicate exception,
+  including unexpected causes, malformed UTF-8 or a bare admission exception.
+  Exception messages and candidate text stay private.
+
+**Guard limitation:** the unchanged golden suite is a **built-in-registry
+regression check only; it does not test candidate tenant rules**. There is no
+resource swap for tenant candidates. A configured `guard_command` runs **once
+before listening** on the unchanged built-in resource; non-zero exit
+(`guard_failed`), launch failure or timeout (`guard_unavailable`) refuses startup.
+Golden JSON cases also check built-ins only at startup, not composed tenant policy.
+Each evaluation's existing guard fields record startup `guard_status: "passed"`
+and `skipped_tests: "unknown"`, even for invalid requests. A refused startup has
+no evaluation records; without a command there are no guard fields, as before.
+Tenant admission and paired dev evaluation are **separate checks**. Demonstrate
+candidate-dependent loading/scoring with synthetic positive/negative probes before
+generation release; do not claim golden-suite non-regression for composed policy.
+
 ## HTTP and evidence
 
 | Route | Reply |

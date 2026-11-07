@@ -32,6 +32,7 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.function.Predicate;
 import java.util.regex.PatternSyntaxException;
@@ -50,9 +51,18 @@ public final class FirewallHost {
     private final Path guardResource;
     private final long guardTimeoutNanos;
     private final Map<String, String> guardResults = new java.util.HashMap<>();
+    private final TenantMode tenant;
+    private final List<Predicate<String>> builtins;
+    private final String startupGuardStatus;
+
+    // Local envelope convention: replace this one exact LF-terminated line, without YAML serialization.
+    private static final String TENANT_MARKER = "# RSI_TENANT_RULES\n";
+    private record TenantMode(String prefix, String suffix, int slotIndentation, Method parse, Method compile,
+                              Object compiler, String rulesAccessor, Class<?> admissionException) { }
 
     private record Case(String text, boolean mustMatch) { }
     private static final class GuardUnavailable extends Exception { }
+    private static final class TenantContainment extends Exception { }
     private static final class Ineligible extends Exception {
         final String reason;
         Ineligible(String reason) { this.reason = reason; }
@@ -103,6 +113,80 @@ public final class FirewallHost {
             guardResource = null;
             guardTimeoutNanos = 0;
         }
+        tenant = tenantConfig();
+        builtins = tenant == null ? List.of() : load(Files.readAllBytes(path("guard_resource_path")));
+        if (tenant != null) {
+            for (Case guard : guards.values()) {
+                if (!correct(builtins, guard)) throw new IllegalStateException("GoldenGuardFailure");
+            }
+        }
+        startupGuardStatus = startupGuard();
+        if (tenant != null && !guardCommand.isEmpty() && !startupGuardStatus.equals("passed")) {
+            throw new IllegalStateException(startupGuardStatus);
+        }
+    }
+
+    private String startupGuard() throws InterruptedException {
+        if (tenant == null || guardCommand.isEmpty()) return "not_run";
+        try {
+            return runGuard();
+        } catch (IOException e) {
+            return "guard_unavailable";
+        }
+    }
+
+    private TenantMode tenantConfig() throws Exception {
+        List<String> keys = List.of("tenant_envelope_path", "tenant_parse", "tenant_compile",
+                "tenant_rules_accessor", "tenant_admission_exception");
+        if (keys.stream().noneMatch(config::containsKey)) return null;
+        keys.forEach(this::required);
+        String envelope = Files.readString(path("tenant_envelope_path"), StandardCharsets.UTF_8);
+        int marker = envelope.indexOf(TENANT_MARKER);
+        if (marker < 0 || (marker > 0 && envelope.charAt(marker - 1) != '\n')
+                || envelope.indexOf(TENANT_MARKER, marker + TENANT_MARKER.length()) >= 0) {
+            throw new IllegalArgumentException("tenant envelope needs one exact marker line");
+        }
+        String prefix = envelope.substring(0, marker);
+        String slot = prefix.lines().filter(line -> !line.isBlank() && !line.stripLeading().startsWith("#"))
+                .reduce((previous, current) -> current).orElse("");
+        var mapping = java.util.regex.Pattern.compile("^( *)([^\\s:#-][^:#]*): *(?:#.*)?$").matcher(slot);
+        if (slot.indexOf('\t') >= 0 || !mapping.matches()) throw new TenantContainment();
+        int slotIndentation = mapping.group(1).length();
+        String suffix = envelope.substring(marker + TENANT_MARKER.length());
+        String next = suffix.lines().filter(line -> !line.isBlank() && !line.stripLeading().startsWith("#"))
+                .findFirst().orElse("");
+        if (!next.isEmpty() && (next.length() - next.stripLeading().length() > slotIndentation
+                || next.substring(0, next.length() - next.stripLeading().length()).indexOf('\t') >= 0)) {
+            throw new TenantContainment();
+        }
+        String[] parser = member("tenant_parse"), compiler = member("tenant_compile");
+        Class<?> parserClass = Class.forName(parser[0], true, classes);
+        Class<?> compilerClass = Class.forName(compiler[0], true, classes);
+        Method parse = parserClass.getMethod(parser[1], String.class);
+        if (!java.lang.reflect.Modifier.isPublic(parserClass.getModifiers())
+                || !java.lang.reflect.Modifier.isPublic(compilerClass.getModifiers())
+                || !java.lang.reflect.Modifier.isStatic(parse.getModifiers())) {
+            throw new IllegalArgumentException("tenant APIs require public classes and a static parser");
+        }
+        Method compile = java.util.Arrays.stream(compilerClass.getMethods())
+                .filter(method -> method.getName().equals(compiler[1]) && method.getParameterCount() == 1)
+                .reduce((first, second) -> { throw new IllegalArgumentException("ambiguous tenant compiler"); })
+                .orElseThrow(() -> new IllegalArgumentException("missing tenant compiler"));
+        if (java.lang.reflect.Modifier.isStatic(compile.getModifiers())) {
+            throw new IllegalArgumentException("tenant compiler must be an instance method");
+        }
+        return new TenantMode(prefix, suffix, slotIndentation,
+                parse, compile,
+                compilerClass.getConstructor().newInstance(), required("tenant_rules_accessor"),
+                Class.forName(required("tenant_admission_exception"), true, classes));
+    }
+
+    private String[] member(String key) {
+        String[] member = required(key).split("#", -1);
+        if (member.length != 2 || member[0].isBlank() || member[1].isBlank()) {
+            throw new IllegalArgumentException("expected Class#method");
+        }
+        return member;
     }
 
     public static void main(String[] args) throws Exception {
@@ -180,7 +264,7 @@ public final class FirewallHost {
         String contentId = "";
         String status = "operational";
         String reason = "IllegalArgumentException";
-        String guardStatus = "not_run";
+        String guardStatus = tenant == null ? "not_run" : startupGuardStatus;
         int code = 400;
         String body;
         try {
@@ -201,14 +285,22 @@ public final class FirewallHost {
             }
             List<String> items = items(req.get("item_ids"));
             code = 500; // From here failures are operational, except the explicit eligibility stages.
-            if (!guardCommand.isEmpty()) {
+            if (tenant == null && !guardCommand.isEmpty()) {
                 guardStatus = guard(contentId, components.get(componentName));
                 if (guardStatus.equals("guard_failed")) throw new Ineligible("guard_failed");
                 if (guardStatus.equals("guard_unavailable")) throw new GuardUnavailable();
             }
-            List<Predicate<String>> predicates = load(components.get(componentName));
-            for (Case guard : guards.values()) {
-                if (!correct(predicates, guard)) throw new Ineligible("GoldenGuardFailure");
+            List<Predicate<String>> predicates;
+            if (tenant == null) {
+                predicates = load(components.get(componentName));
+            } else {
+                predicates = new ArrayList<>(builtins);
+                predicates.addAll(loadTenant(components.get(componentName)));
+            }
+            if (tenant == null) {
+                for (Case guard : guards.values()) {
+                    if (!correct(predicates, guard)) throw new Ineligible("GoldenGuardFailure");
+                }
             }
             body = results(predicates, items);
             code = 200;
@@ -373,6 +465,44 @@ public final class FirewallHost {
             throw e;
         }
         if (!(loaded instanceof List<?> rules)) throw new IllegalStateException("loader must return List");
+        return predicates(rules);
+    }
+
+    private List<Predicate<String>> loadTenant(byte[] candidate) throws Exception {
+        String text = StandardCharsets.UTF_8.newDecoder().decode(java.nio.ByteBuffer.wrap(candidate)).toString();
+        if (!text.endsWith("\n")) throw new TenantContainment();
+        // The YAML 1.1 parser also breaks lines at NEL, LS and PS; String.lines() does not.
+        if (text.chars().anyMatch(c -> c == 0x85 || c == 0x2028 || c == 0x2029)) throw new TenantContainment();
+        for (String line : text.lines().toList()) {
+            int indentation = 0;
+            while (indentation < line.length() && (line.charAt(indentation) == ' '
+                    || line.charAt(indentation) == '\t')) {
+                if (line.charAt(indentation) == '\t') throw new TenantContainment();
+                indentation++;
+            }
+            if (!line.isBlank() && !line.substring(indentation).startsWith("#")
+                    && indentation <= tenant.slotIndentation()) throw new TenantContainment();
+        }
+        Object parsed = tenant.parse().invoke(null, tenant.prefix() + text + tenant.suffix());
+        if (!(parsed instanceof Optional<?> document)) throw new IllegalStateException("parser must return Optional");
+        if (document.isEmpty()) throw new Ineligible("TenantParseEmpty");
+        Object view;
+        try {
+            view = tenant.compile().invoke(tenant.compiler(), document.get());
+        } catch (InvocationTargetException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof IllegalStateException && cause.getCause() != null
+                    && cause.getCause().getClass().equals(tenant.admissionException())) {
+                throw new Ineligible(tenant.admissionException().getSimpleName());
+            }
+            throw e;
+        }
+        Object loaded = view.getClass().getMethod(tenant.rulesAccessor()).invoke(view);
+        if (!(loaded instanceof List<?> rules)) throw new IllegalStateException("tenant accessor must return List");
+        return predicates(rules);
+    }
+
+    private static List<Predicate<String>> predicates(List<?> rules) throws Exception {
         List<Predicate<String>> predicates = new ArrayList<>();
         for (Object rule : rules) {
             Object matcher = rule.getClass().getMethod("matcher").invoke(rule);
