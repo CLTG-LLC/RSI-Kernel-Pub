@@ -21,7 +21,7 @@ the tenant rule layer (the host product's tenant-rule design and testing handove
 exact file and line references are kept in the private decision record, not in this
 published repository).
 [Amazon Macie custom data identifiers](https://docs.aws.amazon.com/macie/latest/user/custom-data-identifiers.html) are only an analogous product precedent.
-Scope R-193 is extended by R-248 to a tenant-layer `custom_rules` artifact on the
+The owner's recorded scope disposition is extended by the owner's standing grant to a tenant-layer `custom_rules` artifact on the
 same offline copy: non-grant, offline, record-only. There is no host-product code
 or policy change, activation or publication.
 
@@ -85,7 +85,7 @@ Adopt H1a and H1b §4 by reference: carve and membership hashes, metric, `runs=1
 candidate dev 353 × 1), zero-margin dev selection and adjudication retention
 (**ties pass**), and **holdout not evaluated / no holdout report**. Apply stays
 record-only with **no snapshot publication**; the monitor posture is not claimed
-as exercised. Approval stays hash-bound per request. Under the R-248 standing
+as exercised. Approval stays hash-bound per request. Under the owner's standing
 grant the lead may approve a record-only apply when retention passes; that approval
 is still logged. Use a **new run directory, `h1c-run-1`**; H1a/H1b records are not
 reused as H1c evidence.

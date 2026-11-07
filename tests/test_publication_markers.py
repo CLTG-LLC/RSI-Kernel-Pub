@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # Built from fragments so this file never matches itself; no file is exempt.
 # Private host/repo names are deliberately not listed: naming them here would publish them.
 MARKERS = {
-    "lane decision id": r"\bR-0\d\d\b",
+    "lane decision id": r"\bR-\d{3,}\b",
     "lane research id": r"\bR-[A-Z]\b",
     "build memo": "BUILD" + "-MEMO",
     "decision log": "DECISIONS" + "-RSI",
@@ -61,7 +61,7 @@ def test_no_internal_markers_in_tracked_files():
 
 
 def test_every_marker_is_detected():
-    samples = ["R-0" + "15", "R-" + "K", "BUILD" + "-MEMO", "DECISIONS" + "-RSI", "/" + "Users/x",
+    samples = ["R-0" + "15", "R-1" + "93", "R-" + "K", "BUILD" + "-MEMO", "DECISIONS" + "-RSI", "/" + "Users/x",
                "/private" + "/tmp/x", "B1" + "–B13", "o" + "cx proxy", "Smart" + "TiTu",
                "SMART" + "TITU_API_KEY", "tg" + "-work", "Trust" + " Gateway", "tg" + "-java",
                "SP" + "EC B4"]

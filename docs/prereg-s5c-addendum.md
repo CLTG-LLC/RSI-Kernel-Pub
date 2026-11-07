@@ -54,7 +54,7 @@ loader, format or validation is introduced.
 | `task_group_002` | **excluded** — see §2.2 | none |
 | `task_group_003` | **excluded** — see §2.2 | none |
 
-Owner approval is **R-179**, 2026-11-06; the S5b acceptance outcome is `updated`.
+Owner approval is **on record**, 2026-11-06; the S5b acceptance outcome is `updated`.
 The request and approval match on candidate, evaluator, data and code hashes, and
 apply was record-only (`docs/results/e1a-s5b-evaluate-first.md`, "Acceptance
 outcome"). The approved candidate's parent is the empty library, content id
@@ -255,7 +255,7 @@ stated as limitations, not claimed as results.
   pattern, lineage checks, exposure STOP and separate status/outcome reporting.
 - `docs/results/e1a-s5b-evaluate-first.md`, "Scope and frozen inputs", "Per group,
   selection and stop", "Cost" (lines 498–503), "Acceptance outcome" and "Exposure
-  log": approved group-001 id, empty-library parent, R-179 approval, record-only
+  log": approved group-001 id, empty-library parent, recorded owner approval, record-only
   `updated`, exclusions, measured planning figures and prior exposure.
 - `src/rsi_kernel/adapters/gdpevo_memory/pilot.py:33–52` (hash-checked loader and
   live hooks); `src/rsi_kernel/adapters/gdpevo_memory/proposer.py:50–55`

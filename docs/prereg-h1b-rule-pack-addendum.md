@@ -55,7 +55,7 @@ freeze-time, file-hash, content-id and parent-id reporting requirements.
 
 **Order:** assign the author only **after this preregistration is merged AND an
 independent release re-check record exists that releases generation**. Only then
-may the proposal be written and frozen. Lesson R-221, disclosed in the H1a report:
+may the proposal be written and frozen. The earlier generation-order lesson, disclosed in the H1a report:
 evaluation waiting for release does not cure proposal generation before release.
 No post-score repair, replacement or replenishment is permitted.
 
@@ -64,7 +64,7 @@ No post-score repair, replacement or replenishment is permitted.
 Adopt H1a and `docs/results/h1a-rule-pack.md` (“Frozen identities” and “Pre-run STOPs
 and the release re-check”) by reference, including:
 
-- Scope R-193: an offline copy, non-grant and record-only; no host-product change,
+- The owner's recorded scope disposition: an offline copy, non-grant and record-only; no host-product change,
   activation, deployment or publication, and no sealed-set evaluation or proposal
   to the host product's team without a separate disposition.
 - The host at its frozen identity, champion, actual built-class manifests,

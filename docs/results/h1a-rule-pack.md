@@ -35,7 +35,7 @@ proposed to the host product's team without a separate disposition (prereg §1, 
 | Apply | Record-only. Nothing replaces the champion or publishes rules. Nothing reached that step in this run |
 | Product | No host-product code or policy change, activation, deployment or publication. The offline copy's resource was swapped only for the guard call and then restored |
 | Data | Public pools only, dev material. No product sealed set was opened or used |
-| Grant scope | Not amended; this is a separate, non-grant experiment (owner disposition R-193) |
+| Grant scope | Not amended; this is a separate, non-grant experiment (the owner's recorded disposition) |
 | Proposal source | One complete proposal written by a data-blind author before evaluation; no live or evaluation-fed proposer (prereg §2.2, §9) |
 
 ## Frozen identities
@@ -126,13 +126,13 @@ adjudication items could not be evaluated in this run by construction.
 |---|---|
 | Champion | Startup bytes of the copied built-in pack, sha256 `404cd8c4d27086d3dbed6b9431d788846500184516988339f8923b7d63744fd0`, content_id `90da5b4c517c85b3b915b202ecf470aa0792c1584dd08a2f65f4b3b3c846429c`; 62 rules |
 | Proposal | `proposal-1.yml` sha256 `acf4837a69c3019dfd3fac8687b890acf86a5099313523120c014566c54a1cff`, content_id `0e8cb2bc27a5ec1e6667c69c69db4ccebe237fba67e8bc5b146253b18c06afc7`, parent = champion; frozen read-only (mode 0444) before evaluation |
-| Proposal content (counts only) | The 62 existing rules unchanged, 11 request-phase regex rules appended (10 block, 1 monitor), manifest count updated to 73 (R-213). **Additions only** |
+| Proposal content (counts only) | The 62 existing rules unchanged, 11 request-phase regex rules appended (10 block, 1 monitor), manifest count updated to 73 (per the freeze record). **Additions only** |
 | Author | One fresh bounded writer with the `proposal-author` role, assigned by the lead; one authoring job; one proposal; no repair or replacement |
 | Author access (attested in the retained brief) | The champion pack plus the product's loader, rule and phase source files. No dev, adjudication or holdout items, no tests, no golden fixtures, no lane notes and no web access. The author had no JDK, so the proposal was not loaded before evaluation; loader validity was left to the evaluation (422 if invalid) |
 
 Disclosure: prereg §§2.2 and 9 restrict the author's input to the champion pack and frozen task/format instructions. The attested access also included the product's loader, rule and phase source files. These contain no data, test or fixture content, so the author stayed data-blind, but the input boundary was wider than preregistered.
 
-Proposal generation also preceded the required release check: R-213 records the proposal frozen at 20:42 CST on 2026-11-06, before the final-host re-freeze recorded in R-217 at 20:58 and the independent release in R-219 at 21:06. This deviated from the preregistered generation order. R-219 subsequently authorized evaluation of that single frozen proposal; it does not establish that generation followed the required order.
+Proposal generation also preceded the required release check: The freeze record shows the proposal frozen at 20:42 CST on 2026-11-06, before the final-host re-freeze recorded at 20:58 and the independent release at 21:06. This deviated from the preregistered generation order. The release record subsequently authorized evaluation of that single frozen proposal; it does not establish that generation followed the required order.
 
 ## Pre-run STOPs and the release re-check
 
@@ -141,7 +141,7 @@ before the proposal was evaluated.
 
 | Pre-run STOP | Status | Evidence |
 |---|---|---|
-| H1A-CARVE / H1A-EVAL-CAP | Closed | Carve frozen and validated as above. `eval_cap` = **706** = champion dev 353 × 1 + one registered candidate 353 × 1 (prereg §2.3 formula; lead disposition R-210/R-216). The first pre-run report also offered the attempt-based 1,412; the lead chose the registered-candidate reading the prereg states |
+| H1A-CARVE / H1A-EVAL-CAP | Closed | Carve frozen and validated as above. `eval_cap` = **706** = champion dev 353 × 1 + one registered candidate 353 × 1 (prereg §2.3 formula; lead dispositions on record). The first pre-run report also offered the attempt-based 1,412; the lead chose the registered-candidate reading the prereg states |
 | H1A-GUARD-BINDING | Closed | The guard runs the product's existing golden classes unchanged, against an offline copy whose rules resource holds the exact candidate bytes. Test failure → 422, infrastructure failure → 500 (PR #81, reviewed and merged) |
 | 1. Host identity | Closed | Host re-frozen at `83268e4` after PR #89 (the restore temp is now created only after the guard run) |
 | 2. Classes build identity | Closed | No jar exists. The `target/classes` tree manifest `7076d7c7…6ffe` was taken at the start and end of the re-freeze and was byte-identical; 0 `.guard-*` files before and after |
@@ -177,7 +177,7 @@ and A2, and B2 in a separate host process, all produced response sha256
 two earlier reproductions on the pre-fix host. `runs=1` is adopted on this basis
 (prereg §6).
 
-History, in order (dispositions from R-199 to R-219):
+History, in order (from the lead's recorded dispositions):
 
 1. The prereg PR #79 first failed review (2 S2 findings). The lead applied the
    exact replacements, the re-check passed, and it merged.
@@ -187,11 +187,11 @@ History, in order (dispositions from R-199 to R-219):
    - **N1** (only two guard classes run): all three classes from prereg §5 are
      required.
    - **eval_cap**: 706.
-   A later correction (R-214) withdrew the proposed Maven overwrite flag. The
+   A later recorded correction withdrew the proposed Maven overwrite flag. The
    product's plugin 3.5.0 uses content-based change detection, so a stale target
    copy is recopied on the next build. The only real defect was the temp file.
 3. Re-freeze at `83268e4`: everything passed. An independent re-check was requested.
-4. **Release re-check: HOLD** (R-218), with four findings: S2, golden-resource hashes
+4. **Release re-check: HOLD** (decision record), with four findings: S2, golden-resource hashes
    missing; S2, no clean detached execution tree or manifest; S3, a wrong
    validator digest in a receipt; S3, wording that called skipped tests "executed".
 5. The lead added `golden-resource-identity.json`, the clean detached tree and
@@ -200,7 +200,7 @@ History, in order (dispositions from R-199 to R-219):
      `2d3a154b…6a2b`, did not match; the full digest is
      `2d3a154b09edf6e02c66f763aecb22af76a56e69b9552e0cc11d42e74c849a66`;
    - "executed" became "reported" in three places, so skips are not counted as passes.
-6. **Re-check: RELEASE** (R-219). All four findings were closed. The reviewer
+6. **Re-check: RELEASE** (decision record). All four findings were closed. The reviewer
    independently rehashed the golden resources against the product commit's blobs,
    33 kernel files against the commit, and every manifest binding. The release
    covered evaluation of the single frozen proposal only: offline, record-only, no
@@ -322,7 +322,7 @@ This additions-only proposal cannot satisfy the frozen inventory and coverage ch
 |---|---|
 | Proposal hash | `acf4837a…` before and after the run (`hashes-before.txt`, `hashes-after.txt`) |
 | Rules resource in the offline source tree | `404cd8c4…4fd0` after the run, byte-identical; 0 `.guard-*` files anywhere in the offline copy (`guard-strays.txt` empty) |
-| Stale offline build output | Right after the run, `target/classes/firewall/runtime-firewall-rules.yml` still held the proposal bytes (`acf4837a…`). This is the expected stale-target effect (R-214), not a restore failure. A guard build would recopy it under content-based change detection, as call B2 above showed. `mvn -o -q process-resources` (exit 0) recopied the champion, and the offline classes manifest returned to `7076d7c7…6ffe` (`offline-classes-manifest-restored.txt`). This was harmless to the run: the champion is loaded from the source tree, and the guard rebuilds before testing |
+| Stale offline build output | Right after the run, `target/classes/firewall/runtime-firewall-rules.yml` still held the proposal bytes (`acf4837a…`). This is the expected stale-target effect (see the later correction above), not a restore failure. A guard build would recopy it under content-based change detection, as call B2 above showed. `mvn -o -q process-resources` (exit 0) recopied the champion, and the offline classes manifest returned to `7076d7c7…6ffe` (`offline-classes-manifest-restored.txt`). This was harmless to the run: the champion is loaded from the source tree, and the guard rebuilds before testing |
 | Host process | Stopped by the script; exit 143; confirmed gone |
 | Execution tree | Clean detached tree at `83268e4`; no kernel, CLI or host change during the run |
 
@@ -333,12 +333,12 @@ Required by prereg §7:
 - **Private-API reflection, offline copy only.** The host calls the product's
   package-private static `load(InputStream, List)` through reflection (precedent:
   the product's own `PolicySnapshotRuntimeFirewallViewTest.java:478–483`;
-  R-195). This is not a supported product API.
+  decision record). This is not a supported product API.
 - **Residual adaptive overfitting.** All data is public, writer-visible research
   material, so it is **adaptive dev material**. The adjudication and holdout
   subsets are **not independent**, even though they were not evaluated here and
   the author never accessed them.
-- **Sealed-set overlap cannot be determined** (R-197). A names-and-counts-only
+- **Sealed-set overlap cannot be determined** (per the decision record). A names-and-counts-only
   check found no way to compare the public sources with the host product's sealed
   sets without opening sealed provenance, which is forbidden. Overlap is not
   asserted absent.
@@ -355,7 +355,7 @@ Required by prereg §7:
   `evaluator_hash` = sha256 of `execution-manifest.json` (`66a08dc2…08b9`) and
   `code_hash` = the kernel sources aggregate (`897fd9fe…edbf`). **They went
   unused.** They only bind an approval in `accept`, which did not run.
-- Label caveats carried from the provenance assessment (R-196): Arcanum includes
+- Label caveats carried from the provenance assessment: Arcanum includes
   plain interrogative examples in the Intents pillar, which are kept as attack
   labels, not relabelled. The deepset card's licence fields conflict (top-level
   Apache-2.0 vs nested CC-BY-4.0). The more restrictive reading, attribution
@@ -426,7 +426,7 @@ Run-relative paths under the private run root. None of these files is published.
 - `h1a-build/prerun/RESULTS.md`, `execution-manifest.json`,
   `golden-resource-identity.json`, `carve-validation.json`, `counts.json`
 - The private data-provenance assessment for H1a
-- Decision records R-193 to R-220
+- Decision records for the H1a steps above
 
 ## Not covered
 

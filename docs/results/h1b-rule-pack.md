@@ -29,15 +29,15 @@ proposed to the host product's team without a separate disposition (H1a prereg �
 
 H1b prereg §3 requires the author to be assigned only after the prereg is merged
 and an independent release record exists. That order was followed this time,
-unlike H1a (R-221, disclosed in the H1a report):
+unlike H1a (the earlier generation-order lesson, disclosed in the H1a report):
 
 | Step | Record |
 |---|---|
-| Prereg merged | `51404d1` (#93), R-225 |
-| Independent release re-check: frozen identities rehashed, no H1b proposal present | GENERATION-RELEASE, R-226 |
-| Author assigned | R-227, after R-226 |
-| Proposal frozen, admission check passed | R-228 |
-| Run-time re-verify, reproduce-first, dev campaign | R-229, R-230 |
+| Prereg merged | `51404d1` (#93), decision record |
+| Independent release re-check: frozen identities rehashed, no H1b proposal present | GENERATION-RELEASE, decision record |
+| Author assigned | Decision record, after the release record |
+| Proposal frozen, admission check passed | Decision record |
+| Run-time re-verify, reproduce-first, dev campaign | Decision records |
 
 ## Proposal and admission
 
@@ -156,7 +156,7 @@ resources need a separate owner disposition.
 |---|---|
 | Proposal | `31b4d649…` and 0444 before and after |
 | Offline source resource | `404cd8c4…` after the run; 0 `.guard-*` files |
-| Stale build output | As in H1a, `target/classes` held the proposal bytes after the run (R-214). `mvn -o -q process-resources` (exit 0) recopied the champion, and the classes manifest returned to `7076d7c7…`. The lead independently confirmed both resource copies at `404cd8c4…` afterwards |
+| Stale build output | As in H1a, `target/classes` held the proposal bytes after the run (as recorded for H1a). `mvn -o -q process-resources` (exit 0) recopied the champion, and the classes manifest returned to `7076d7c7…`. The lead independently confirmed both resource copies at `404cd8c4…` afterwards |
 | Host process | Stopped by its own PID; no host process remained |
 | Execution tree | Unchanged at `83268e4` |
 
@@ -193,7 +193,7 @@ Private run-relative paths; none is published.
   `run-campaign.*`, `hashes-*.txt`, `guard-strays.txt`,
   `offline-classes-manifest-*.txt`, `host/`, `store/`, `surefire-proposal/`
   (counts and method names only)
-- Decision records R-225 to R-230
+- Decision records for the H1b steps above
 
 ## Not covered
 

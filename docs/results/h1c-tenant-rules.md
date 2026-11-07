@@ -32,27 +32,27 @@ The order followed the release records.
 
 | Step | Record |
 |---|---|
-| Feasibility on the offline copy, public APIs only (synthetic probes) | R-253 |
-| H1c prereg merged | `1dca137` (#102), R-257 |
-| Host tenant mode merged after two security fixes (below) | `881f6d3` (#103), R-265 |
-| Pre-generation checks (a)–(e): ALL-PASS | R-267 (identity count corrected to 54/54 in R-268) |
-| Independent release re-check (f) | GENERATION-RELEASE, R-268 |
-| Run 1 author assigned, proposal frozen | R-269, R-270 |
-| Run 1 | `h1c-run-1`, R-271 |
-| Amendment 1 merged | `9a5fb09` (#105), R-274 |
-| Independent release re-check; fresh author assigned | R-275 |
-| Run 2 proposal frozen | R-276 |
-| Run 2 and accept | `h1c-run-2`, R-277, R-278 |
+| Feasibility on the offline copy, public APIs only (synthetic probes) | Decision record |
+| H1c prereg merged | `1dca137` (#102), decision record |
+| Host tenant mode merged after two security fixes (below) | `881f6d3` (#103), decision record |
+| Pre-generation checks (a)–(e): ALL-PASS | Decision record (identity count corrected to 54/54 in the release record) |
+| Independent release re-check (f) | GENERATION-RELEASE, decision record |
+| Run 1 author assigned, proposal frozen | Decision records |
+| Run 1 | `h1c-run-1`, decision record |
+| Amendment 1 merged | `9a5fb09` (#105), decision record |
+| Independent release re-check; fresh author assigned | Decision record |
+| Run 2 proposal frozen | Decision record |
+| Run 2 and accept | `h1c-run-2`, decision records |
 
 ## Host tenant mode and its security history
 
 The host mode substitutes the candidate list into a frozen policy envelope
 (`c83f39f4…`, 0444) and parses and compiles it through the product's public APIs.
 Built-in rules are unchanged. Review of #103 found that candidate bytes could escape
-the list slot (R-261). A containment check was added, mapped to 500
+the list slot (recorded in review). A containment check was added, mapped to 500
 `TenantContainment`. An independent re-check then found a YAML 1.1 line-break gap
-(R-265). That gap was closed by rejecting those characters before parsing. The final
-fix was applied by the lead after the single re-check, as R-265 discloses.
+(recorded in the re-check). That gap was closed by rejecting those characters before parsing. The final
+fix was applied by the lead after the single re-check, as the decision record discloses.
 
 ## Pre-generation checks (H1c prereg §3)
 
@@ -80,7 +80,7 @@ Pattern text is not reproduced here.
 | Proposal | `proposal-1.yml` sha256 `5c4322c13bda5d850dcf0f9095de2cc429843e52893f0f284c8a086c3305dc5f`, content_id `4978d75f…9b66`, 11 rules, frozen 0444 at 2026-11-07 19:08:12 CST | `proposal-2.yml` sha256 `91b47b5abada10243caf12ea551ae187c09021fcdbb5824c906073138f487464`, content_id `98deb5baa17d580c6d3e5c91ff9fd0ccee50e276c08adf6bbcf0899660770a53`, 14 rules, frozen 0444 at 2026-11-07 19:47:43 CST |
 | Author | Fresh data-blind Opus (`proposal-author`); 4 tool calls by its own count; attested reads within the §4 boundary | Fresh data-blind GPT-6.1-Sol, a different author; 12 tool calls by its own count, including 1 rejected read; attested 9 allowed reads. It received the run 1 inputs plus the amendment 1 key layout, and no run 1 information |
 | Parent content_id | `2a981d52d766c0fff03c41cc159be4a2ff5b6b6c670202728edb3b3cfdf0af98` | `2a981d52d766c0fff03c41cc159be4a2ff5b6b6c670202728edb3b3cfdf0af98` |
-| Format | Flat `expression`/`flags` on each rule. The brief omitted the `matcher` layout, which was known from the feasibility probe (R-270) | `matcher` layout present on every rule (R-276) |
+| Format | Flat `expression`/`flags` on each rule. The brief omitted the `matcher` layout, which was known from the feasibility probe (per the run 1 freeze record) | `matcher` layout present on every rule (per the run 2 freeze record) |
 
 ## Run-time verification
 
@@ -137,10 +137,10 @@ Accept host evidence: 2 `ok` calls, one for champion `2a981d52…` and one for p
 (sha256 `0a5a423e…2e04`): candidate `98deb5ba…`, code `897fd9fe…`, data `2df04406…`,
 evaluator `66a08dc2…`. The lead checked these hashes against the run configuration
 and the selected candidate. It then wrote `approval.json` (sha256 `5cc8f42e…b2a8`,
-approver Billy) under the owner's standing grant R-248, and logged it in R-278.
+approver Billy) under the owner's standing grant, and logged it in the decision record.
 `accept` returned `{"candidate_id": "98deb5ba…", "outcome": "updated"}`. The
 campaign record now holds that acceptance. The accept worker stopped on a provider
-error after launch; the lead completed verification (R-278).
+error after launch; the lead completed verification (per the decision record).
 
 ## Interpretation
 
@@ -197,7 +197,7 @@ Private run-relative paths; none is published.
 - `h1c-run-2/accept/` (`score-summary.json`, `cases-identity.json`,
   `host-evidence.jsonl`, `startup-guard.json`, `host.properties.diff.txt`),
   `store/approval-request.json`, `store/approval.json`
-- Decision records R-246 to R-280
+- Decision records for the H1c steps above
 
 ## Not covered
 

@@ -635,7 +635,7 @@ disclosed, continued independence is not claimed.
   matches the recorded reconciliation (`pilot-config/s4b/s5b-exposure-reconciliation.md`:
   36/0/12/30, 36/0/0/0, 9/0/0/0); its evidence-dir counts exceed graded rows by one
   per phase, the grader-only calibration replay, which is not a solve.
-- Additional disclosure (R-174, 2026-11-06 13:43 CST): during an operational check, the lead printed part of one holdout attempt's grader output, including rubric goal text. The decision record states that it was not used for any decision and no copy was kept. This was an additional disclosure, not an additional solve; it does not change the solve counts above. Continued independence is not claimed.
+- Additional disclosure (decision record, 2026-11-06 13:43 CST): during an operational check, the lead printed part of one holdout attempt's grader output, including rubric goal text. The decision record states that it was not used for any decision and no copy was kept. This was an additional disclosure, not an additional solve; it does not change the solve counts above. Continued independence is not claimed.
 - Compared with S5, dev exposure rose from 27 to 81 solves: 27 champion solves
   plus 54 candidate solves, comprising three evaluated candidates in each of
   groups 001 and 002 and none in group 003.
