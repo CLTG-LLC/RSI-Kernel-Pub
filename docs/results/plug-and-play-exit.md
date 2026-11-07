@@ -7,7 +7,7 @@ Three claims are kept separate throughout:
 | Claim | Status in this report |
 |---|---|
 | Capability demonstrated (the kernel runs a campaign and an approval-gated accept through the plug-in surfaces) | criteria 1, 2, 5, 6, 7 below |
-| Continuation demonstrated (the same kernel bytes close campaigns on further tiers) | demonstrated for the skill, harness-code and memory tiers: kernel-only hash `8ea2ae0a…e2bc` at S4b, E1c and S5c, each campaign closed (§3); "close" means a terminal outcome, not a retained update; context and tool-routing tiers untested |
+| Continuation demonstrated (the same kernel bytes close campaigns on further tiers) | demonstrated for the skill, harness-code and memory tiers: kernel-only hash `8ea2ae0a…e1a2bc` at S4b, E1c and S5c, each campaign closed (§3); "close" means a terminal outcome, not a retained update; context and tool-routing tiers untested |
 | Retained second update demonstrated (a ratchet from an approved champion, parent → child) | not demonstrated (S4b: no second retained update), §4 |
 
 ## 1. Wheel in a clean venv, campaign plus accept from the console entry, no checkout present
