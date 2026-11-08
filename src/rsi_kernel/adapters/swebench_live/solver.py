@@ -6,9 +6,16 @@ Only staged issue text, skill text and verified read-only Codex tools are mounte
 no dataset, cache, grader, evidence, private store or Docker socket.
 
 The injected grader owns the official harness command and its documented network,
-and must run it in a fresh container named by ``container_name``. The prompt is a
-required frozen host input because its template is selected at preregistration.
-No live Docker or model call is made by this module's tests.
+and must run it in a fresh container named by ``container_name``. The prompt is
+rendered per instance from the frozen package template, not the legacy caller
+input. No live Docker or model call is made by this module's tests.
+
+Prompt attribution: OpenHands benchmarks (MIT), commit
+701700e6cad1f6309f456213a974544644bda0f4:
+https://github.com/OpenHands/benchmarks/blob/701700e6cad1f6309f456213a974544644bda0f4/benchmarks/swebenchmultilingual/prompts/default.j2
+Exactly two named local exceptions (docs/prereg-fd2-swebench-live.md section 2.1):
+(a) Skill sentence appended; (b) Python/conda-specific environment lines removed
+(upstream lines 9, 22 and 23). The MIT notice is in THIRD_PARTY_NOTICES.md.
 """
 
 from __future__ import annotations
@@ -38,6 +45,8 @@ from .tasks import SweTask
 PLATFORM = "linux/amd64"
 CODEX_HOME = "/tmp/swe-codex-home"
 SOLVER_COMMAND = GDP_SOLVER_COMMAND.replace("/tmp/gdpevo-codex-home", CODEX_HOME)
+PROMPT_TEMPLATE_PATH = Path(__file__).with_name("prompt_template.j2")
+PROMPT_TEMPLATE_SHA256 = "64bae603f032d401a3b140b11e1df7ba4e1bb4d7376310e1d2d0ea96b845b6c4"
 
 # Official release API asset.digest values (the complete .tar.gz bytes), fetched
 # from https://api.github.com/repos/openai/codex/releases/tags/rust-v0.166.0 .
@@ -57,6 +66,21 @@ OFFICIAL_CODEX_DIGESTS = MappingProxyType({name: value[1] for name, value in COD
 
 Grader = Callable[..., tuple[Mapping, Mapping | None]]
 
+
+def _render_prompt(task: SweTask, repo: str, base: str) -> str:
+    body = PROMPT_TEMPLATE_PATH.read_bytes()
+    if hashlib.sha256(body).hexdigest() != PROMPT_TEMPLATE_SHA256:
+        raise ValueError("prompt template digest mismatch")
+    template = body.decode("utf-8")
+    unresolved = (template.replace("{{ instance.repo_path }}", "")
+                  .replace("{{ instance.base_commit }}", "")
+                  .replace("{{ instance.problem_statement }}", ""))
+    if "{{" in unresolved or "{%" in unresolved:
+        raise ValueError("unresolved prompt template markers")
+    # Insert issue text last: it is data, never another template to render.
+    return (template.replace("{{ instance.repo_path }}", repo)
+            .replace("{{ instance.base_commit }}", base)
+            .replace("{{ instance.problem_statement }}", task.statement))
 
 
 def _image_repository(name: str) -> str:
@@ -147,17 +171,16 @@ class SweSolver(DockerSolver):
     """DockerSolver supplies only its scoped Docker/forwarder/timeout helpers."""
 
     def __init__(self, *, tasks: Sequence[SweTask], evidence_dir: Path, timeout: float,
-                 codex_assets: Path, grader: Grader, grading_image: str, prompt: str):
+                 codex_assets: Path, grader: Grader, grading_image: str):
         if isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be a positive frozen config value")
-        if not evidence_dir.is_absolute() or not grading_image or not isinstance(prompt, str) or not prompt.strip():
-            raise ValueError("absolute evidence path, grading image and frozen prompt are required")
+        if not evidence_dir.is_absolute() or not grading_image:
+            raise ValueError("absolute evidence path and grading image are required")
         self.tasks = {task.item_id: task for task in tasks}
         if not self.tasks or len(self.tasks) != len(tasks):
             raise ValueError("tasks must be non-empty with unique item ids")
         self.evidence_dir, self.timeout = evidence_dir.resolve(), timeout
         self.codex_assets, self.grader, self.grading_image = Path(codex_assets), grader, grading_image
-        self.prompt = prompt
         self._pins = SimpleNamespace(codex_assets=CODEX_ASSETS)
 
     def __call__(self, candidate: Candidate, item_id: str, *, run: int = 0) -> dict:
@@ -188,7 +211,7 @@ class SweSolver(DockerSolver):
             phase = "repo_discovery"
             repo, base = self._repository(scope, out)
             phase = "solver"
-            self._solve(out, scope, repo)
+            self._solve(out, scope, repo, base, task)
             phase = "trace"
             self._trace_repo(out, scope, repo)
             phase = "staging"
@@ -269,18 +292,21 @@ class SweSolver(DockerSolver):
             raise _Stop("repo_head")
         return lines[0], lines[1]
 
-    def _solve(self, out: Path, scope: str, repo: str) -> None:
+    def _solve(self, out: Path, scope: str, repo: str, base: str, task: SweTask) -> None:
+        prompt = _render_prompt(task, repo, base)
+        prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         started = datetime.datetime.now(datetime.timezone.utc).isoformat()
         begin, attached = time.monotonic(), None
         command = SOLVER_COMMAND.replace("-C /work", "-C " + repo)
         try:
             attached = self._run(["docker", "exec", scope + "-agent", "bash", "-c", command,
-                                  "run-one", self.prompt], out / "exec-stdout.jsonl", check=False)
+                                  "run-one", prompt], out / "exec-stdout.jsonl", check=False)
         except subprocess.TimeoutExpired:
             self._stop_timed_out(out, scope + "-agent")
             raise
         finally:
             _json(out / "attempt-timing.json", {"started_utc": started,
+                  "prompt_sha256": prompt_sha256,
                   "elapsed_seconds": time.monotonic() - begin,
                   "docker_attach_exit_code": attached.returncode if attached else None,
                   "container_exit_code": None})

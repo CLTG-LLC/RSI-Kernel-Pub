@@ -32,6 +32,37 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+### OpenHands benchmarks prompt (MIT)
+
+- **File:** `src/rsi_kernel/adapters/swebench_live/prompt_template.j2`.
+- **Upstream:** https://github.com/OpenHands/benchmarks/blob/701700e6cad1f6309f456213a974544644bda0f4/benchmarks/swebenchmultilingual/prompts/default.j2
+- **Named local exceptions:** skill sentence appended; Python/conda-specific environment lines 9, 22 and 23 removed. See `docs/prereg-fd2-swebench-live.md` section 2.1.
+- **Licence source:** https://github.com/OpenHands/benchmarks/blob/701700e6cad1f6309f456213a974544644bda0f4/LICENSE
+
+```
+MIT License
+
+Copyright (c) 2025 All Hands AI
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ## Dependencies resolved in `uv.lock`
 
 None of these are vendored in this repository; they are installed from their own distributions and keep their own licences. Several NumPy/SciPy versions are lockfile alternatives for different Python versions, not all installed together.

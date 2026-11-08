@@ -3,6 +3,7 @@
 import hashlib
 import json
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -178,7 +179,6 @@ def fixture(tmp_path, monkeypatch):
     solver = module.SweSolver(
         tasks=[task()], evidence_dir=tmp_path / "evidence", timeout=30,
         codex_assets=fake.assets, grader=grader, grading_image="synthetic-grader@sha256:" + "c" * 64,
-        prompt="Read /work/problem_statement.md and /work/skill/SKILL.md; fix the issue.",
     )
     solver._pins.codex_assets = fake.pins
     return module, solver, fake, grades
@@ -375,3 +375,91 @@ def test_distinct_grade_output_per_attempt_and_run(fixture):
 def test_repository_reference_drops_tag_and_digest(name, expected):
     from rsi_kernel.adapters.swebench_live import solver as module
     assert module._image_repository(name) == expected
+
+
+def test_frozen_prompt_template_matches_preregistered_bytes():
+    from rsi_kernel.adapters.swebench_live import solver as module
+
+    body = Path(module.__file__).with_name("prompt_template.j2").read_bytes()
+    assert hashlib.sha256(body).hexdigest() == "64bae603f032d401a3b140b11e1df7ba4e1bb4d7376310e1d2d0ea96b845b6c4"
+    assert len(body) == 3686 and len(body.splitlines()) == 62
+    assert body.endswith(b"\n")
+
+
+def test_prompt_renders_only_upstream_placeholders():
+    from rsi_kernel.adapters.swebench_live import solver as module
+
+    template = Path(module.__file__).with_name("prompt_template.j2").read_text(encoding="utf-8")
+    expected = (template.replace("{{ instance.repo_path }}", "/synthetic-repo")
+                .replace("{{ instance.base_commit }}", "synthetic-base")
+                .replace("{{ instance.problem_statement }}", task().statement))
+    prompt = module._render_prompt(task(), "/synthetic-repo", "synthetic-base")
+    assert prompt == expected
+    assert task().statement in prompt and "/synthetic-repo" in prompt and "synthetic-base" in prompt
+    assert "Read /work/skill/SKILL.md and follow its instructions while you resolve the issue.\n" in prompt
+    assert "{{" not in prompt and "{%" not in prompt
+
+
+@pytest.mark.parametrize("statement", [
+    "Fix {{ unknown }}.", "Fix {% if unknown %}.",
+    "Keep {{ instance.repo_path }} literal.",
+    "Keep {{ instance.base_commit }} literal.",
+    "Keep {{ instance.problem_statement }} literal.",
+    "Document an unmatched {{ token.",
+])
+def test_prompt_preserves_statement_markers_verbatim(statement):
+    from rsi_kernel.adapters.swebench_live import solver as module
+
+    prompt = module._render_prompt(
+        replace(task(), _statement=statement), "/repo", "base"
+    )
+    assert f"<issue_description>\n{statement}\n</issue_description>" in prompt
+
+
+@pytest.mark.parametrize("marker", ["{{ unknown }}", "{% if unknown %}"])
+def test_prompt_rejects_leftover_template_markers(tmp_path, monkeypatch, marker):
+    from rsi_kernel.adapters.swebench_live import solver as module
+
+    body = Path(module.__file__).with_name("prompt_template.j2").read_bytes() + marker.encode("utf-8")
+    template = tmp_path / "prompt_template.j2"
+    template.write_bytes(body)
+    monkeypatch.setattr(module, "PROMPT_TEMPLATE_PATH", template)
+    # Isolate marker validation from the separately tested production digest pin.
+    monkeypatch.setattr(module, "PROMPT_TEMPLATE_SHA256", hashlib.sha256(body).hexdigest())
+    with pytest.raises(ValueError, match="unresolved prompt template"):
+        module._render_prompt(task(), "/repo", "base")
+
+
+def test_prompt_rejects_template_digest_drift(tmp_path, monkeypatch):
+    from rsi_kernel.adapters.swebench_live import solver as module
+
+    template = tmp_path / "prompt_template.j2"
+    template.write_text("changed template\n", encoding="utf-8")
+    monkeypatch.setattr(module, "PROMPT_TEMPLATE_PATH", template)
+    with pytest.raises(ValueError, match="prompt template digest"):
+        module._render_prompt(task(), "/repo", "base")
+
+
+def test_codex_receives_rendered_prompt(fixture):
+    module, _, fake, _ = fixture
+    fake.workdir, fake.head = "/discovered-repo", "discovered-head"
+    assert solve(fixture)["score"] == 1.0
+    command = next(argv for argv, _ in fake.calls if argv[:2] == ["docker", "exec"] and "git" not in argv)
+    assert command[-1] == module._render_prompt(task(), fake.workdir, fake.head)
+    assert command[-2] == "run-one"
+    assert "codex exec -C /discovered-repo" in command[-3]
+
+
+@pytest.mark.parametrize("failure", [None, "timeout"])
+def test_attempt_evidence_records_prompt_hash_not_text_even_on_timeout(fixture, failure):
+    _, _, fake, _ = fixture
+    fake.failure = failure
+    solve(fixture)
+    command = next(argv for argv, _ in fake.calls if argv[:2] == ["docker", "exec"] and "git" not in argv)
+    timing = json.loads((fake.attempt() / "attempt-timing.json").read_text())
+    assert timing["prompt_sha256"] == hashlib.sha256(command[-1].encode("utf-8")).hexdigest()
+    # The intentional solver input under stage/ is not attempt metadata or a log.
+    for path in fake.attempt().iterdir():
+        if path.is_file():
+            assert task().statement not in path.read_text(encoding="utf-8")
+            assert command[-1] not in path.read_text(encoding="utf-8")
