@@ -56,6 +56,13 @@ context's endpoint with `docker context inspect` and exports DOCKER_HOST only
 to its child processes. Docker context documentation:
 https://docs.docker.com/engine/manage-resources/contexts/
 
+LOW_DISK_BYTES defaults to 2147483648 bytes. Before each instance and run the
+driver prints free bytes on / and Docker's root plus Docker's usage totals. It
+stops when either free-space value is below the threshold, records stop_reason
+"low_disk" in the summary, and exits nonzero. With DOCKER_CONTEXT set, a Docker
+Desktop daemon path is inside its VM rather than on the host, so the Docker
+root free-space diagnostic is null and only host / is guarded.
+
   DOCKER_CONTEXT=my-context tools/fd2/gold_smoke.sh \
     --harness-dir /path/to/SWE-bench-Live \
     --frozen-jsonl smoke/frozen.jsonl \

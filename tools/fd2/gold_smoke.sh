@@ -11,6 +11,10 @@ HARNESS_DIR=
 FROZEN_JSONL=
 SELECTION=
 OUTPUT_DIR=
+# NAMED LOCAL EXCEPTION: operational guard so the runner survives to upload
+# the summary; not a quality gate. Override with LOW_DISK_BYTES.
+LOW_DISK_BYTES="${LOW_DISK_BYTES:-2147483648}"
+case "$LOW_DISK_BYTES" in ''|*[!0-9]*) printf 'LOW_DISK_BYTES must be a nonnegative integer\n' >&2; exit 2 ;; esac
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --harness-dir) HARNESS_DIR="${2:?}" ;;
@@ -51,10 +55,11 @@ if [ -n "${DOCKER_CONTEXT:-}" ]; then
   export DOCKER_HOST
 fi
 DOCKER_PLATFORM="$(docker "${DOCKER_CONTEXT_ARGS[@]}" version --format '{{.Server.Os}}/{{.Server.Arch}}')" || exit 1
+DOCKER_ROOT="$(docker "${DOCKER_CONTEXT_ARGS[@]}" info -f '{{.DockerRootDir}}')" || exit 1
 
 write_summary() {
   local exit_status="$1"
-  python - "$ROWS" "$SUMMARY" "$DOCKER_PLATFORM" "${DOCKER_CONTEXT:-}" <<'PY'
+  python - "$ROWS" "$SUMMARY" "$DOCKER_PLATFORM" "${DOCKER_CONTEXT:-}" "${2:-}" <<'PY'
 import json
 import sys
 with open(sys.argv[1], encoding="utf-8") as stream:
@@ -65,7 +70,7 @@ for key in dict.fromkeys((row["instance_id"], row["split"]) for row in runs):
     instances.append({"instance_id": key[0], "split": key[1], "runs": matching})
 with open(sys.argv[2], "w", encoding="utf-8") as stream:
     json.dump({"instances": instances, "docker_platform": sys.argv[3],
-               "docker_context": sys.argv[4]}, stream, indent=2, sort_keys=True)
+               "docker_context": sys.argv[4], "stop_reason": sys.argv[5] or None}, stream, indent=2, sort_keys=True)
     stream.write("\n")
 PY
   local summary_status=$?
@@ -83,7 +88,39 @@ fail_stop() {
 }
 
 cd "$HARNESS_DIR" || exit 1
+check_disk() {
+  local phase="$1"
+  local root_free docker_free=null docker_usage docker_df
+  if ! root_free="$(python3 -c 'import shutil; print(shutil.disk_usage("/").free)')"; then
+    fail_stop 'Disk measurement failed'
+  fi
+  # A named context can point to a Docker Desktop VM; its daemon root is not a
+  # host path, so only the host / measurement is meaningful there.
+  if [ -z "${DOCKER_CONTEXT:-}" ]; then
+    if ! docker_free="$(python3 -c 'import shutil,sys; print(shutil.disk_usage(sys.argv[1]).free)' "$DOCKER_ROOT")"; then
+      fail_stop 'Disk measurement failed'
+    fi
+  fi
+  if ! docker_df="$(docker "${DOCKER_CONTEXT_ARGS[@]}" system df --format '{{json .}}')"; then
+    fail_stop 'Docker disk diagnostic failed'
+  fi
+  if ! docker_usage="$(python3 -c \
+      'import json,sys; print(" ".join("{}={}/{}".format(r.get("Type"), r.get("TotalCount"), r.get("Size")) for line in sys.stdin if line.strip() for r in [json.loads(line)]))' \
+      <<< "$docker_df")"; then
+    fail_stop 'Docker disk diagnostic parse failed'
+  fi
+  printf 'Disk diagnostics: phase=%s root_free_bytes=%s docker_root_free_bytes=%s docker_system_df="%s"\n' \
+    "$phase" "$root_free" "$docker_free" "$docker_usage"
+  if [ "$root_free" -lt "$LOW_DISK_BYTES" ] ||
+      { [ "$docker_free" != null ] && [ "$docker_free" -lt "$LOW_DISK_BYTES" ]; }; then
+    printf 'STOP reason=low_disk phase=%s root_free_bytes=%s docker_root_free_bytes=%s threshold_bytes=%s\n' \
+      "$phase" "$root_free" "$docker_free" "$LOW_DISK_BYTES"
+    write_summary 1 'low_disk'
+    exit $?
+  fi
+}
 while IFS=$'\t' read -r instance_id split image; do
+  check_disk "before-instance"
   if ! docker "${DOCKER_CONTEXT_ARGS[@]}" pull "$image" > "$HARNESS_LOGS/pull.log" 2>&1; then
     printf 'Image pull failed; stopping before evaluation: %s\n' "$instance_id"
     write_summary 1
@@ -120,6 +157,7 @@ PY
     fi
   }
   for run in 1 2 3; do
+    check_disk "before-run-$run"
     output="$OUTPUT_DIR/$split/run-$run"
     if ! before="$(python3 -c 'import shutil; print(shutil.disk_usage("/").free)')"; then
       fail_stop 'Disk measurement failed'

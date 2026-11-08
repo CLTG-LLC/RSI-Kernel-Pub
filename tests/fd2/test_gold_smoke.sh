@@ -23,6 +23,8 @@ printf 'docker %s\n' "$*" >> "$ORDER"
 if [ "${1:-}" = "--context" ]; then shift 2; fi
 case "${1:-}" in
   version) printf 'linux/arm64\n' ;;
+  info) printf '/\n' ;;
+  system) [ "${FAIL_DOCKER_DF:-0}" != 1 ] || exit 9; printf '{"Type":"Images","TotalCount":"1","Size":"1B"}\n' ;;
   context) printf 'unix:///nonexistent-test-docker.sock\n' ;;
   pull) ;;
   image)
@@ -59,7 +61,15 @@ fi
 printf 'python %s\n' "$*" >> "$ORDER"
 if [ "${FAIL_ROW_WRITE:-0}" = 1 ] && [ "$#" -eq 12 ] && [ "${3:-}" = demo-2 ]; then exit 9; fi
 if [ "${FAIL_DISK_MEASURE:-0}" = 1 ] && [ "${1:-}" = -c ]; then exit 9; fi
-if [ "${FAIL_SUMMARY_WRITE:-0}" = 1 ] && [ "$#" -eq 5 ] && [ -n "$ORDER" ]; then
+if [ "${1:-}" = -c ] && [[ "${2:-}" = *'shutil.disk_usage(sys.argv[1])'* ]]; then
+  printf '%s\n' "${MOCK_DOCKER_FREE:-1000000000}"
+  exit 0
+fi
+if [ "${1:-}" = -c ] && [[ "${2:-}" = *'shutil.disk_usage("/")'* ]]; then
+  printf '%s\n' "${MOCK_ROOT_FREE:-1000000000}"
+  exit 0
+fi
+if [ "${FAIL_SUMMARY_WRITE:-0}" = 1 ] && [ "$#" -eq 6 ] && [ -n "$ORDER" ]; then
   case "$ORDER" in *summary-failure*) exit 9 ;; esac
 fi
 exec "$REAL_PYTHON" "$@"
@@ -72,7 +82,7 @@ run_smoke() {
   shift
   mkdir -p "$TMP/$name"
   : > "$TMP/$name/order"
-  if ORDER="$TMP/$name/order" PATH="$TMP/bin:$PATH" DOCKER_CONTEXT=smoke-test \
+  if ORDER="$TMP/$name/order" PATH="$TMP/bin:$PATH" DOCKER_CONTEXT=smoke-test LOW_DISK_BYTES=0 \
       "$@" "$DRIVER" --harness-dir "$TMP/harness" --frozen-jsonl "$TMP/frozen.jsonl" \
       --selection "$TMP/selection.json" --output-dir "$TMP/$name/output" \
       > "$TMP/$name/stdout" 2> "$TMP/$name/stderr"; then
@@ -128,6 +138,7 @@ with open(sys.argv[1], encoding="utf-8") as stream:
     summary = json.load(stream)
 assert summary["docker_platform"] == "linux/arm64"
 assert summary["docker_context"] == "smoke-test"
+assert summary["stop_reason"] is None
 assert len(summary["instances"]) == 2
 assert [run["resolved"] for run in summary["instances"][0]["runs"]] == [True] * 3
 PY
@@ -163,7 +174,7 @@ mkdir -p "$TMP/workflow/SWE-bench-Live" "$TMP/workflow/smoke"
 cp "$TMP/frozen.jsonl" "$TMP/workflow/smoke/frozen.jsonl"
 cp "$TMP/selection.json" "$TMP/workflow/smoke/selection.json"
 : > "$TMP/workflow/order"
-if ! (cd "$TMP/workflow" && ORDER="$TMP/workflow/order" PATH="$TMP/bin:$PATH" \
+if ! (cd "$TMP/workflow" && ORDER="$TMP/workflow/order" PATH="$TMP/bin:$PATH" LOW_DISK_BYTES=0 \
     "$DRIVER" --harness-dir SWE-bench-Live --frozen-jsonl smoke/frozen.jsonl \
     --selection smoke/selection.json --output-dir smoke/output \
     > stdout 2> stderr); then
@@ -175,6 +186,7 @@ import json
 import sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     summary = json.load(stream)
+assert summary["stop_reason"] is None
 assert len(summary["instances"]) == 2
 assert sum(len(item["runs"]) for item in summary["instances"]) == 6
 assert all(run["disk_free_bytes_before"] > 0 for item in summary["instances"] for run in item["runs"])
@@ -225,5 +237,46 @@ else
   printf 'Summary writer failure did not stop\n' >&2
   exit 1
 fi
+
+# The operational low-disk guard stops before pulling and records its reason.
+if ! run_smoke low-disk env MOCK_ROOT_FREE=100 LOW_DISK_BYTES=200; then
+  grep -q 'STOP reason=low_disk phase=before-instance root_free_bytes=100 docker_root_free_bytes=null' "$TMP/low-disk/stdout"
+else
+  printf 'Low disk did not stop the driver\n' >&2
+  exit 1
+fi
+! grep -q '^docker .* pull' "$TMP/low-disk/order"
+"$REAL_PYTHON" - "$TMP/low-disk/output/summary.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    summary = json.load(stream)
+assert summary["stop_reason"] == "low_disk"
+assert summary["instances"] == []
+PY
+[ "$(grep -c '^Disk diagnostics:' "$TMP/success/stdout")" = 8 ]
+
+# Without a named context, a low Docker root must stop even when / is healthy.
+mkdir -p "$TMP/docker-low"
+: > "$TMP/docker-low/order"
+if ORDER="$TMP/docker-low/order" PATH="$TMP/bin:$PATH" MOCK_ROOT_FREE=1000000000 MOCK_DOCKER_FREE=100 LOW_DISK_BYTES=200 \
+    "$DRIVER" --harness-dir "$TMP/harness" --frozen-jsonl "$TMP/frozen.jsonl" \
+    --selection "$TMP/selection.json" --output-dir "$TMP/docker-low/output" \
+    > "$TMP/docker-low/stdout" 2> "$TMP/docker-low/stderr"; then
+  printf 'Low Docker root did not stop the driver\n' >&2
+  exit 1
+fi
+grep -q 'STOP reason=low_disk phase=before-instance root_free_bytes=1000000000' "$TMP/docker-low/stdout"
+grep -q 'docker_root_free_bytes=100 threshold_bytes=200' "$TMP/docker-low/stdout"
+
+# Check the diagnostic command separately; do not mistake its failure for empty data.
+if ! run_smoke docker-df-failure env FAIL_DOCKER_DF=1; then
+  grep -q 'Docker disk diagnostic failed; stopping' "$TMP/docker-df-failure/stderr"
+else
+  printf 'Docker diagnostic failure did not stop\n' >&2
+  exit 1
+fi
+test -f "$TMP/docker-df-failure/output/summary.json"
+! grep -q '^harness run' "$TMP/docker-df-failure/order"
 
 printf 'FD2 gold smoke fake-docker tests PASS\n'
