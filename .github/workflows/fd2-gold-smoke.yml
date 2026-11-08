@@ -19,18 +19,36 @@ jobs:
           # Read the storage mode while the daemon runs; stop the socket too so no
           # client call re-activates dockerd with the old configuration.
           driver_status="$(docker info -f '{{json .DriverStatus}}')"
+          # The containerd image store "uses more disk space than the legacy storage
+          # drivers" for the same images (docs.docker.com/engine/storage/containerd/);
+          # a 19.7 GB image grew to ~104 GB of image data there and STOPped low_disk
+          # (#137). Switch to the legacy store first, via the documented
+          # features.containerd-snapshotter=false, deep-merged so other features survive.
+          if printf '%s' "$driver_status" | grep -q 'io.containerd.snapshotter'; then
+            sudo systemctl stop docker.socket docker
+            sudo mkdir -p /etc/docker
+            if sudo test -f /etc/docker/daemon.json; then
+              sudo jq '. * {"features":{"containerd-snapshotter":false}}' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
+            else
+              printf '%s\n' '{"features":{"containerd-snapshotter":false}}' | sudo tee /etc/docker/daemon.json.new >/dev/null
+            fi
+            sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+            sudo systemctl start docker.socket docker
+            driver_status="$(docker info -f '{{json .DriverStatus}}')"
+            if printf '%s' "$driver_status" | grep -q 'io.containerd.snapshotter'; then
+              echo 'containerd snapshotter still in use after the switch' >&2; exit 1
+            fi
+            docker info -f 'StorageDriver={{.Driver}}'
+            echo 'Legacy image store now in use (containerd snapshotter disabled)'
+          fi
           driver_before="$(docker info -f '{{.Driver}}')"
-          # Relocate only where it is both possible and sufficient: /mnt is a separate
-          # filesystem and the classic store is in use (data-root alone does not move a
-          # containerd-store's images). Otherwise keep the layout and rely on the
-          # per-instance disk diagnostics and the low-disk STOP in gold_smoke.sh.
-          # A dispatch observed / = 145G with 88G free, /mnt on the same device, and the
-          # containerd snapshotter, so the relocation is skipped there by design.
+          # Relocate only where it is possible: /mnt is a separate filesystem. The
+          # legacy store is in use from here on, so data-root moves its images.
+          # Otherwise keep the layout and rely on the per-instance disk diagnostics
+          # and the low-disk STOP in gold_smoke.sh. A dispatch observed / = 145G with
+          # 88G free and /mnt on the same device, so the relocation is skipped there.
           if [ "$(stat -c %d /mnt)" = "$(stat -c %d /)" ]; then
             echo 'Skipping relocation: /mnt is on the same filesystem as /'; exit 0
-          fi
-          if printf '%s' "$driver_status" | grep -q 'io.containerd.snapshotter'; then
-            echo 'Skipping relocation: containerd image store in use'; exit 0
           fi
           # runner-images Ubuntu2404 README: Docker 28.0.4; Docker's containerd
           # storage docs make it the default only for fresh 29.0+ installations.
