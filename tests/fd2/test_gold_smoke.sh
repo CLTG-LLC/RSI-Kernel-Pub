@@ -8,13 +8,16 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 REAL_PYTHON="$(command -v python3)"
 export REAL_PYTHON
+# Run the driver with the interpreter running this test unless BASH_BIN says
+# otherwise, so macOS /bin/bash 3.2 and a newer bash are both exercised.
+BASH_BIN="${BASH_BIN:-$BASH}"
 
 mkdir -p "$TMP/bin" "$TMP/harness" "$TMP/output"
 cat > "$TMP/frozen.jsonl" <<'EOF'
 {"instance_id":"demo-1","split":"python","docker_image":"registry.invalid/demo:tag"}
 EOF
 cat > "$TMP/selection.json" <<'EOF'
-{"instances":[{"instance_id":"demo-1","split":"python","docker_image":"registry.invalid/demo:tag"},{"instance_id":"demo-2","split":"python","docker_image":"registry.invalid/demo:tag"}]}
+{"instances":[{"instance_id":"demo-1","split":"python","docker_image":"registry.invalid/demo:tag"},{"instance_id":"demo-2","split":"python","docker_image":"registry.invalid/demo:tag2"}]}
 EOF
 cat > "$TMP/bin/docker" <<'STUB'
 #!/usr/bin/env bash
@@ -23,21 +26,46 @@ printf 'docker %s\n' "$*" >> "$ORDER"
 if [ "${1:-}" = "--context" ]; then shift 2; fi
 case "${1:-}" in
   version) printf 'linux/arm64\n' ;;
-  info) printf '/\n' ;;
+  info) printf '%s\n' "${FAKE_DOCKER_ROOT:-/}" ;;
   system) [ "${FAIL_DOCKER_DF:-0}" != 1 ] || exit 9; printf '{"Type":"Images","TotalCount":"1","Size":"1B"}\n' ;;
   context) printf 'unix:///nonexistent-test-docker.sock\n' ;;
-  pull) ;;
+  pull)
+    if [ "${WATCH_ABORT_PULL:-0}" = 1 ] && [[ "${*: -1}" = *:tag ]]; then
+      if [ -n "${DISK_PHASE_FILE:-}" ]; then touch "$DISK_PHASE_FILE/low"; fi
+      sleep 10
+    fi
+    # Only a completed pull registers the image; a killed pull leaves none.
+    : > "$ORDER.image"
+    ;;
   image)
+    if [ "$2" = rm ]; then ref="${4:-}"; else ref="${3:-}"; fi
+    if [ "$2" = inspect ] && [ "${FAIL_INSPECT:-0}" = 1 ]; then
+      printf 'Cannot connect to the Docker daemon\n' >&2; exit 1
+    fi
+    if [ ! -e "$ORDER.image" ]; then
+      printf 'Error response from daemon: No such image: %s\n' "$ref" >&2; exit 1
+    fi
     case "$2 ${5:-}" in
-      "inspect {{index .RepoDigests 0}}") printf 'registry.invalid/demo@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n' ;;
+      "inspect {{index .RepoDigests 0}}") printf '%s@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n' "${3%%@*}" ;;
       "inspect {{.Size}}") printf '123\n' ;;
       "inspect {{.Id}}") printf 'sha256:image-id\n' ;;
-      "rm ") [ "${FAIL_REMOVE:-0}" != 1 ] ;;
-      "inspect sha256:image-id") exit 1 ;;
+      "rm ")
+        [ "${FAIL_REMOVE:-0}" != 1 ] || { printf 'Error response from daemon: conflict\n' >&2; exit 1; }
+        # A forced removal by ID or tag deletes the image and all its tags.
+        rm -f "$ORDER.image"
+        ;;
       *) exit 1 ;;
     esac
     ;;
-  ps) : ;;
+  ps)
+    # Instance cleanup starts here; RECOVER_DISK models it freeing the disk.
+    if [ "${RECOVER_DISK:-0}" = 1 ] && [ -n "${DISK_PHASE_FILE:-}" ]; then rm -f "$DISK_PHASE_FILE/low"; fi
+    # A persistent container survives the killed harness until removed.
+    if [ -n "${FAKE_CONTAINER:-}" ] && [[ "$*" = *'name=^git-launch-demo-1-'* ]]; then
+      printf '%s\n' "$FAKE_CONTAINER"
+    fi
+    ;;
+  rm) [ "${2:-}" = -f ] || exit 1 ;;
   *) printf 'Unexpected docker call: %s\n' "$*" >&2; exit 1 ;;
 esac
 STUB
@@ -53,20 +81,38 @@ if [ "${1:-}" = -m ] && [ "${2:-}" = evaluation.evaluation ]; then
     else shift; fi
   done
   printf 'harness run %s\n' "$instance_id" >> "$ORDER"
+  if [ "${WATCH_ABORT_HARNESS:-0}" = 1 ] && [ "$instance_id" = demo-1 ]; then
+    if [ -n "${DISK_PHASE_FILE:-}" ]; then touch "$DISK_PHASE_FILE/low"; fi
+    sleep 10
+  fi
+  if [ "${WATCH_MEASURE_FAIL_HARNESS:-0}" = 1 ] && [ "$instance_id" = demo-1 ]; then
+    touch "$DISK_PHASE_FILE/measure-fail"
+    sleep 10
+  fi
   mkdir -p "$output/$instance_id"
   printf 'DOCKER_HOST=%s\n' "${DOCKER_HOST:-}" > "$output/docker-host.txt"
   printf '{"resolved":true}\n' > "$output/$instance_id/report.json"
   exit "${FAIL_HARNESS:-0}"
 fi
 printf 'python %s\n' "$*" >> "$ORDER"
-if [ "${FAIL_ROW_WRITE:-0}" = 1 ] && [ "$#" -eq 12 ] && [ "${3:-}" = demo-2 ]; then exit 9; fi
+if [ "${FAIL_ROW_WRITE:-0}" = 1 ] && [ "$#" -eq 13 ] && [ "${3:-}" = demo-2 ]; then exit 9; fi
 if [ "${FAIL_DISK_MEASURE:-0}" = 1 ] && [ "${1:-}" = -c ]; then exit 9; fi
+# One transient measurement failure, consumed by the first / measurement.
+if [ -n "${DISK_PHASE_FILE:-}" ] && [ -e "$DISK_PHASE_FILE/measure-fail" ] &&
+    [ "${1:-}" = -c ] && [[ "${2:-}" = *'shutil.disk_usage("/")'* ]]; then
+  rm -f "$DISK_PHASE_FILE/measure-fail"
+  exit 9
+fi
 if [ "${1:-}" = -c ] && [[ "${2:-}" = *'shutil.disk_usage(sys.argv[1])'* ]]; then
   printf '%s\n' "${MOCK_DOCKER_FREE:-1000000000}"
   exit 0
 fi
 if [ "${1:-}" = -c ] && [[ "${2:-}" = *'shutil.disk_usage("/")'* ]]; then
-  printf '%s\n' "${MOCK_ROOT_FREE:-1000000000}"
+  if [ -n "${DISK_PHASE_FILE:-}" ] && [ -e "$DISK_PHASE_FILE/low" ]; then
+    printf '100\n'
+  else
+    printf '%s\n' "${MOCK_ROOT_FREE:-1000000000}"
+  fi
   exit 0
 fi
 if [ "${FAIL_SUMMARY_WRITE:-0}" = 1 ] && [ "$#" -eq 6 ] && [ -n "$ORDER" ]; then
@@ -82,8 +128,8 @@ run_smoke() {
   shift
   mkdir -p "$TMP/$name"
   : > "$TMP/$name/order"
-  if ORDER="$TMP/$name/order" PATH="$TMP/bin:$PATH" DOCKER_CONTEXT=smoke-test LOW_DISK_BYTES=0 \
-      "$@" "$DRIVER" --harness-dir "$TMP/harness" --frozen-jsonl "$TMP/frozen.jsonl" \
+  if ORDER="$TMP/$name/order" PATH="$TMP/bin:$PATH" DOCKER_CONTEXT=smoke-test LOW_DISK_BYTES=0 WATCHDOG_INTERVAL=0.01 \
+      "$@" "$BASH_BIN" "$DRIVER" --harness-dir "$TMP/harness" --frozen-jsonl "$TMP/frozen.jsonl" \
       --selection "$TMP/selection.json" --output-dir "$TMP/$name/output" \
       > "$TMP/$name/stdout" 2> "$TMP/$name/stderr"; then
     return 0
@@ -98,15 +144,17 @@ pin
 harness run
 harness run
 harness run
+inspect
 remove
-verify
+inspect
 pull
 pin
 harness run
 harness run
 harness run
+inspect
 remove
-verify'
+inspect'
   local actual
   # One sequential pass: separate greps would hide reordering.
   actual="$(sed -n \
@@ -114,7 +162,7 @@ verify'
     -e 's/^python .*prepare_frozen.py --pin-image .*/pin/p' \
     -e 's/^harness run.*/harness run/p' \
     -e 's/^docker .* image rm .*/remove/p' \
-    -e 's/^docker .* image inspect sha256:image-id.*/verify/p' "$1")"
+    -e 's/^docker .* image inspect sha256:image-id.*/inspect/p' "$1")"
   [ "$actual" = "$expected" ] || { printf 'Bad operation order:\n%s\n' "$actual" >&2; return 1; }
 }
 
@@ -170,12 +218,25 @@ grep -q 'Exact instance cleanup failed; stopping: demo-1' "$TMP/removal-failure/
 test -f "$TMP/removal-failure/output/summary.json"
 
 # Use the workflow's literal relative arguments and the host's real disk/python.
-mkdir -p "$TMP/workflow/SWE-bench-Live" "$TMP/workflow/smoke"
+mkdir -p "$TMP/workflow/SWE-bench-Live" "$TMP/workflow/smoke" "$TMP/workflow/docker-root"
 cp "$TMP/frozen.jsonl" "$TMP/workflow/smoke/frozen.jsonl"
 cp "$TMP/selection.json" "$TMP/workflow/smoke/selection.json"
+"$REAL_PYTHON" - "$TMP/workflow/smoke/frozen.jsonl" "$TMP/workflow/smoke/selection.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps({"instance_id": "demo-2", "split": "python",
+                             "docker_image": "registry.invalid/demo:tag2"}) + "\n")
+with open(sys.argv[2], encoding="utf-8") as stream:
+    selection = json.load(stream)
+selection["instances"][1]["docker_image"] = "registry.invalid/demo:tag2"
+with open(sys.argv[2], "w", encoding="utf-8") as stream:
+    json.dump(selection, stream)
+PY
 : > "$TMP/workflow/order"
-if ! (cd "$TMP/workflow" && ORDER="$TMP/workflow/order" PATH="$TMP/bin:$PATH" LOW_DISK_BYTES=0 \
-    "$DRIVER" --harness-dir SWE-bench-Live --frozen-jsonl smoke/frozen.jsonl \
+if ! (cd "$TMP/workflow" && ORDER="$TMP/workflow/order" PATH="$TMP/bin:$PATH" LOW_DISK_BYTES=0 WATCHDOG_INTERVAL=0.01 \
+    FAKE_DOCKER_ROOT="$TMP/workflow/docker-root" \
+    "$BASH_BIN" "$DRIVER" --harness-dir SWE-bench-Live --frozen-jsonl smoke/frozen.jsonl \
     --selection smoke/selection.json --output-dir smoke/output \
     > stdout 2> stderr); then
   printf 'Workflow relative-path invocation failed\n' >&2
@@ -195,7 +256,7 @@ PY
 # An actually unwritable summary destination must be fatal.
 mkdir -p "$TMP/unwritable/output/summary.json"
 if ORDER="$TMP/unwritable-order" PATH="$TMP/bin:$PATH" \
-    "$DRIVER" --harness-dir "$TMP/harness" --frozen-jsonl "$TMP/frozen.jsonl" \
+    "$BASH_BIN" "$DRIVER" --harness-dir "$TMP/harness" --frozen-jsonl "$TMP/frozen.jsonl" \
     --selection "$TMP/selection.json" --output-dir "$TMP/unwritable/output" \
     > "$TMP/unwritable/stdout" 2> "$TMP/unwritable/stderr"; then
   printf 'Unwritable summary destination did not stop\n' >&2
@@ -210,7 +271,7 @@ else
   printf 'Disk measurement failure did not stop\n' >&2
   exit 1
 fi
-! grep -q '^harness run' "$TMP/disk-failure/order"
+if grep -q '^harness run' "$TMP/disk-failure/order"; then printf 'Unexpected match %s in %s\n' '^harness run' "$TMP/disk-failure/order" >&2; exit 1; fi
 test -f "$TMP/disk-failure/output/summary.json"
 
 # A row-write failure stops before the second instance and preserves the first.
@@ -220,7 +281,9 @@ else
   printf 'Row write failure did not stop\n' >&2
   exit 1
 fi
-! grep -q '^harness run demo-2' "$TMP/row-failure/order"
+# The injected failure is demo-2's first row write, which follows its first harness
+# run: exactly one demo-2 run, then STOP (no second or third run).
+[ "$(grep -c '^harness run demo-2' "$TMP/row-failure/order")" = 1 ] || { printf 'Row-write failure did not stop after one demo-2 run\n' >&2; exit 1; }
 "$REAL_PYTHON" - "$TMP/row-failure/output/summary.json" <<'PY'
 import json
 import sys
@@ -245,7 +308,7 @@ else
   printf 'Low disk did not stop the driver\n' >&2
   exit 1
 fi
-! grep -q '^docker .* pull' "$TMP/low-disk/order"
+if grep -q '^docker .* pull' "$TMP/low-disk/order"; then printf 'Unexpected match %s in %s\n' '^docker .* pull' "$TMP/low-disk/order" >&2; exit 1; fi
 "$REAL_PYTHON" - "$TMP/low-disk/output/summary.json" <<'PY'
 import json
 import sys
@@ -260,7 +323,7 @@ PY
 mkdir -p "$TMP/docker-low"
 : > "$TMP/docker-low/order"
 if ORDER="$TMP/docker-low/order" PATH="$TMP/bin:$PATH" MOCK_ROOT_FREE=1000000000 MOCK_DOCKER_FREE=100 LOW_DISK_BYTES=200 \
-    "$DRIVER" --harness-dir "$TMP/harness" --frozen-jsonl "$TMP/frozen.jsonl" \
+    "$BASH_BIN" "$DRIVER" --harness-dir "$TMP/harness" --frozen-jsonl "$TMP/frozen.jsonl" \
     --selection "$TMP/selection.json" --output-dir "$TMP/docker-low/output" \
     > "$TMP/docker-low/stdout" 2> "$TMP/docker-low/stderr"; then
   printf 'Low Docker root did not stop the driver\n' >&2
@@ -277,6 +340,108 @@ else
   exit 1
 fi
 test -f "$TMP/docker-df-failure/output/summary.json"
-! grep -q '^harness run' "$TMP/docker-df-failure/order"
+if grep -q '^harness run' "$TMP/docker-df-failure/order"; then printf 'Unexpected match %s in %s\n' '^harness run' "$TMP/docker-df-failure/order" >&2; exit 1; fi
+
+# A mid-pull abort records all three runs, cleans up, and continues after recovery.
+mkdir -p "$TMP/pull-abort"
+if ! run_smoke pull-abort env WATCH_ABORT_PULL=1 RECOVER_DISK=1 DISK_PHASE_FILE="$TMP/pull-abort" \
+    LOW_DISK_BYTES=200 WATCHDOG_INTERVAL=0.05; then
+  printf 'Recovered pull watchdog abort failed\n' >&2
+  exit 1
+fi
+"$REAL_PYTHON" - "$TMP/pull-abort/output/summary.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    summary = json.load(stream)
+assert summary["stop_reason"] is None
+first, second = summary["instances"]
+assert [r["reason"] for r in first["runs"]] == ["low_disk"] * 3
+assert all(not r["resolved"] for r in first["runs"])
+assert all(r["resolved"] for r in second["runs"])
+PY
+# The killed pull never registered an image: confirmed absence is clean.
+if grep -q '^docker .* image rm .*:tag$' "$TMP/pull-abort/order"; then
+  printf 'Missing image was removed by tag\n' >&2
+  exit 1
+fi
+grep -q '^docker .* image rm -f sha256:image-id' "$TMP/pull-abort/order"
+grep -q '^harness run demo-2' "$TMP/pull-abort/order"
+
+# A daemon error while checking the image is not absence: cleanup STOPs.
+mkdir -p "$TMP/inspect-failure"
+if run_smoke inspect-failure env WATCH_ABORT_PULL=1 RECOVER_DISK=1 DISK_PHASE_FILE="$TMP/inspect-failure" \
+    FAIL_INSPECT=1 LOW_DISK_BYTES=200 WATCHDOG_INTERVAL=0.05; then
+  printf 'Image inspect daemon error did not stop the driver\n' >&2
+  exit 1
+fi
+grep -q 'Exact instance cleanup failed; stopping: demo-1' "$TMP/inspect-failure/stdout"
+
+# A harness abort suppresses remaining executions but records all three outcomes.
+mkdir -p "$TMP/harness-abort"
+if ! run_smoke harness-abort env WATCH_ABORT_HARNESS=1 RECOVER_DISK=1 DISK_PHASE_FILE="$TMP/harness-abort" \
+    FAKE_CONTAINER=fake-ctr-1 LOW_DISK_BYTES=200 WATCHDOG_INTERVAL=0.05; then
+  printf 'Recovered harness watchdog abort failed\n' >&2
+  exit 1
+fi
+[ "$(grep -c '^harness run demo-1' "$TMP/harness-abort/order")" = 1 ]
+grep -q '^docker --context smoke-test rm -f fake-ctr-1$' "$TMP/harness-abort/order"
+# The pulled image goes once, by ID; a second removal by tag would fail.
+[ "$(grep -c '^docker .* image rm ' "$TMP/harness-abort/order")" = 2 ]
+"$REAL_PYTHON" - "$TMP/harness-abort/output/summary.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    summary = json.load(stream)
+first, second = summary["instances"]
+assert [r["reason"] for r in first["runs"]] == ["low_disk"] * 3
+assert [r["run"] for r in first["runs"]] == [1, 2, 3]
+assert all(r["resolved"] for r in second["runs"])
+PY
+
+# If disk does not recover after cleanup, stop nonzero and preserve the summary.
+mkdir -p "$TMP/not-recovered"
+if ! run_smoke not-recovered env WATCH_ABORT_PULL=1 DISK_PHASE_FILE="$TMP/not-recovered" \
+    LOW_DISK_BYTES=200 WATCHDOG_INTERVAL=0.05; then
+  test -f "$TMP/not-recovered/output/summary.json"
+else
+  printf 'Unrecovered watchdog abort did not stop\n' >&2
+  exit 1
+fi
+if grep -q '^harness run demo-2' "$TMP/not-recovered/order"; then printf 'Unexpected match %s in %s\n' '^harness run demo-2' "$TMP/not-recovered/order" >&2; exit 1; fi
+"$REAL_PYTHON" - "$TMP/not-recovered/output/summary.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    summary = json.load(stream)
+assert summary["stop_reason"] == "low_disk"
+assert len(summary["instances"]) == 1
+assert [r["reason"] for r in summary["instances"][0]["runs"]] == ["low_disk"] * 3
+PY
+
+# A transient watchdog measurement failure is not low disk: STOP with its
+# reason after removing the instance's containers.
+mkdir -p "$TMP/measure-abort"
+if run_smoke measure-abort env WATCH_MEASURE_FAIL_HARNESS=1 DISK_PHASE_FILE="$TMP/measure-abort" \
+    FAKE_CONTAINER=fake-ctr-1 WATCHDOG_INTERVAL=0.05; then
+  printf 'Watchdog measurement failure did not stop\n' >&2
+  exit 1
+fi
+grep -q 'STOP reason=disk_measurement_failed phase=run-1 instance=demo-1' "$TMP/measure-abort/stdout"
+grep -q '^docker --context smoke-test rm -f fake-ctr-1$' "$TMP/measure-abort/order"
+[ "$(grep -c '^harness run demo-1' "$TMP/measure-abort/order")" = 1 ]
+if grep -q '^harness run demo-2' "$TMP/measure-abort/order"; then
+  printf 'Measurement failure did not stop before demo-2\n' >&2
+  exit 1
+fi
+"$REAL_PYTHON" - "$TMP/measure-abort/output/summary.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    summary = json.load(stream)
+assert summary["stop_reason"] == "disk_measurement_failed"
+# The STOP precedes any row for the killed run, so no null-reason row exists.
+assert summary["instances"] == []
+PY
 
 printf 'FD2 gold smoke fake-docker tests PASS\n'
