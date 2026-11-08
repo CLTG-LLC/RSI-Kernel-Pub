@@ -1,0 +1,75 @@
+{
+  "name": "fd2-grade",
+  "run-name": "${{ inputs.request_id }}",
+  "on": {
+    "workflow_dispatch": {
+      "inputs": {
+        "payload_url": {
+          "description": "Public mirror release asset URL",
+          "required": true,
+          "type": "string"
+        },
+        "sha256": {
+          "description": "SHA-256 of the complete prediction payload",
+          "required": true,
+          "type": "string"
+        },
+        "request_id": {
+          "description": "Unique grading request ID",
+          "required": true,
+          "type": "string"
+        }
+      }
+    }
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "jobs": {
+    "grade": {
+      "runs-on": "ubuntu-26.04",
+      "timeout-minutes": 360,
+      "steps": [
+        {
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        },
+        {
+          "name": "Record actual runner and evaluator even if grading fails",
+          "run": "python tools/fd2/gold_validity.py receipt --output grade-output/runner.json"
+        },
+        {
+          "uses": "./.github/actions/fd2-setup"
+        },
+        {
+          "name": "Verify frozen binding and grade with the official harness",
+          "env": {
+            "PAYLOAD_URL": "${{ inputs.payload_url }}",
+            "PREDICTION_SHA256": "${{ inputs.sha256 }}",
+            "REQUEST_ID": "${{ inputs.request_id }}",
+            "PYTHONPATH": "${{ github.workspace }}/src"
+          },
+          "run": "python tools/fd2/remote_grade.py"
+        },
+        {
+          "id": "publication_scan",
+          "name": "Fail-closed scan of exact artifact files",
+          "if": "always()",
+          "run": "python -m rsi_kernel.publication 'grade-output/binding.json' 'grade-output/results.json' 'grade-output/*/report.json' 'grade-output/runner.json'"
+        },
+        {
+          "name": "Upload only bound reports",
+          "if": "always() && steps.publication_scan.outcome == 'success'",
+          "uses": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+          "with": {
+            "name": "${{ inputs.request_id }}",
+            "path": "grade-output/binding.json\ngrade-output/results.json\ngrade-output/*/report.json\ngrade-output/runner.json",
+            "if-no-files-found": "error"
+          }
+        }
+      ]
+    }
+  },
+  "env": {
+    "PYTHONPATH": "${{ github.workspace }}/src"
+  }
+}

@@ -1,0 +1,178 @@
+{
+  "name": "fd2-gold-validity",
+  "on": {
+    "workflow_dispatch": {
+      "inputs": {
+        "image_digests_url": {
+          "description": "Frozen linux/amd64 image mapping public release asset URL",
+          "required": true,
+          "type": "string"
+        },
+        "image_digests_sha256": {
+          "description": "SHA-256 of frozen image mapping bytes",
+          "required": true,
+          "type": "string"
+        }
+      }
+    }
+  },
+  "permissions": {
+    "contents": "read",
+    "actions": "read"
+  },
+  "jobs": {
+    "matrix": {
+      "runs-on": "ubuntu-26.04",
+      "outputs": {
+        "instances": "${{ steps.matrix.outputs.instances }}"
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        },
+        {
+          "name": "Record actual runner and evaluator",
+          "run": "python tools/fd2/gold_validity.py receipt --output matrix-runner.json"
+        },
+        {
+          "id": "matrix",
+          "name": "Verify frozen mapping before creating any matrix jobs",
+          "env": {
+            "MAPPING_URL": "${{ inputs.image_digests_url }}",
+            "MAPPING_SHA256": "${{ inputs.image_digests_sha256 }}"
+          },
+          "run": "instances=\"$(python tools/fd2/gold_validity.py matrix --mapping-url \"$MAPPING_URL\" --mapping-sha256 \"$MAPPING_SHA256\")\"\necho \"instances=$instances\" >> \"$GITHUB_OUTPUT\""
+        },
+        {
+          "id": "publication_scan",
+          "name": "Fail-closed scan of exact artifact files",
+          "if": "always()",
+          "run": "python -m rsi_kernel.publication 'matrix-runner.json'"
+        },
+        {
+          "uses": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+          "with": {
+            "name": "fd2-gold-validity-matrix",
+            "path": "matrix-runner.json",
+            "if-no-files-found": "error"
+          },
+          "if": "always() && steps.publication_scan.outcome == 'success'"
+        }
+      ]
+    },
+    "gold-validity": {
+      "needs": "matrix",
+      "runs-on": "ubuntu-26.04",
+      "timeout-minutes": 360,
+      "strategy": {
+        "fail-fast": false,
+        "max-parallel": 20,
+        "matrix": "${{ fromJSON(needs.matrix.outputs.instances) }}"
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        },
+        {
+          "name": "Bind item, evaluator, frozen mapping and actual runner build",
+          "env": {
+            "ITEM_ID": "${{ matrix.item_id }}",
+            "IMAGE": "${{ matrix.docker_image }}",
+            "MAPPING_SHA256": "${{ matrix.image_mapping_sha256 }}"
+          },
+          "run": "python tools/fd2/gold_validity.py receipt --item-id \"$ITEM_ID\" --image \"$IMAGE\" --mapping-sha256 \"$MAPPING_SHA256\" --output validity/runner.json"
+        },
+        {
+          "uses": "./.github/actions/fd2-setup"
+        },
+        {
+          "name": "Select exactly this included item and verify frozen data",
+          "env": {
+            "ITEM_ID": "${{ matrix.item_id }}",
+            "IMAGE": "${{ matrix.docker_image }}",
+            "SOURCE_IMAGE": "${{ matrix.source_image }}"
+          },
+          "run": "mkdir -p validity\npython tools/fd2/gold_validity.py select --item-id \"$ITEM_ID\" --image \"$IMAGE\" --source-image \"$SOURCE_IMAGE\" --output validity/selection.json\nhf download SWE-bench-Live/MultiLang --repo-type dataset --revision eb09c2e5db6e4c5a95e01c903c8fd1d5da33c4f3 --include 'data/*.parquet' --quiet > validity/dataset-path.txt\npython tools/fd2/prepare_frozen.py --selection validity/selection.json --dataset-dir \"$(cat validity/dataset-path.txt)\" --output validity/frozen.jsonl"
+        },
+        {
+          "name": "Three gold evaluations, unchanged evaluator",
+          "run": "tools/fd2/gold_smoke.sh --harness-dir SWE-bench-Live --frozen-jsonl validity/frozen.jsonl --selection validity/selection.json --output-dir validity/output"
+        },
+        {
+          "name": "Record outcomes, aborts and unexecuted repetitions",
+          "if": "always()",
+          "env": {
+            "ITEM_ID": "${{ matrix.item_id }}"
+          },
+          "run": "python tools/fd2/gold_validity.py summary --item-id \"$ITEM_ID\" --input validity/output/summary.json --output validity/summary.json"
+        },
+        {
+          "id": "publication_scan",
+          "name": "Fail-closed scan of exact artifact files",
+          "if": "always()",
+          "run": "python -m rsi_kernel.publication 'validity/summary.json' 'validity/runner.json'"
+        },
+        {
+          "uses": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+          "if": "always() && steps.publication_scan.outcome == 'success'",
+          "with": {
+            "name": "fd2-gold-validity-${{ matrix.instance_id }}",
+            "path": "validity/summary.json\nvalidity/runner.json",
+            "if-no-files-found": "error"
+          }
+        }
+      ],
+      "name": "gold-validity / ${{ matrix.item_id }}"
+    },
+    "aggregate": {
+      "needs": [
+        "matrix",
+        "gold-validity"
+      ],
+      "if": "always()",
+      "runs-on": "ubuntu-26.04",
+      "steps": [
+        {
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        },
+        {
+          "name": "Record actual aggregation runner and evaluator",
+          "run": "python tools/fd2/gold_validity.py receipt --output aggregate-runner.json"
+        },
+        {
+          "uses": "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
+          "with": {
+            "pattern": "fd2-gold-validity-*",
+            "path": "summaries"
+          },
+          "continue-on-error": true
+        },
+        {
+          "name": "Aggregate the whole frozen set, missing jobs remain incomplete",
+          "run": "gh api --paginate --slurp \"repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=all&per_page=100\" > job-timestamps.private.json\npython tools/fd2/gold_validity.py aggregate --input summaries --jobs job-timestamps.private.json --output validity.json",
+          "env": {
+            "GH_TOKEN": "${{ github.token }}"
+          }
+        },
+        {
+          "id": "publication_scan",
+          "name": "Fail-closed scan of exact artifact files",
+          "if": "always()",
+          "run": "python -m rsi_kernel.publication 'validity.json' 'aggregate-runner.json'"
+        },
+        {
+          "uses": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+          "if": "always() && steps.publication_scan.outcome == 'success'",
+          "with": {
+            "name": "fd2-gold-validity-aggregate",
+            "path": "validity.json\naggregate-runner.json",
+            "if-no-files-found": "error"
+          }
+        }
+      ]
+    }
+  },
+  "env": {
+    "PYTHONPATH": "${{ github.workspace }}/src"
+  }
+}

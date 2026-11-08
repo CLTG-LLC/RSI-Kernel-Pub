@@ -189,6 +189,9 @@ assert summary["docker_context"] == "smoke-test"
 assert summary["stop_reason"] is None
 assert len(summary["instances"]) == 2
 assert [run["resolved"] for run in summary["instances"][0]["runs"]] == [True] * 3
+for run in summary["instances"][0]["runs"]:
+    assert run["started_at"].endswith("Z") and run["completed_at"].endswith("Z")
+    assert run["wall_seconds"] >= 0 and "@sha256:" in run["image_digests"][0]
 PY
 [ "$(cat "$TMP/success/output/python/run-1/docker-host.txt")" = \
   'DOCKER_HOST=unix:///nonexistent-test-docker.sock' ]
@@ -396,6 +399,7 @@ with open(sys.argv[1], encoding="utf-8") as stream:
 first, second = summary["instances"]
 assert [r["reason"] for r in first["runs"]] == ["low_disk"] * 3
 assert [r["run"] for r in first["runs"]] == [1, 2, 3]
+assert [r["executed"] for r in first["runs"]] == [True, False, False]
 assert all(r["resolved"] for r in second["runs"])
 PY
 
@@ -444,4 +448,24 @@ assert summary["stop_reason"] == "disk_measurement_failed"
 assert summary["instances"] == []
 PY
 
+# A frozen selection may never adopt a different digest returned by the daemon.
+"$REAL_PYTHON" - "$TMP/frozen.jsonl" "$TMP/selection.json" <<'PYCODE'
+import json
+import sys
+row = {"instance_id": "demo-1", "split": "python", "docker_image": "registry.invalid/demo@sha256:" + "e" * 64}
+with open(sys.argv[1], "w") as stream:
+    stream.write(json.dumps(row) + "\n")
+with open(sys.argv[2], "w") as stream:
+    json.dump({"instances": [row]}, stream)
+PYCODE
+if run_smoke digest-mismatch env; then
+  printf 'Frozen image digest mismatch did not STOP before evaluation\n' >&2
+  exit 1
+fi
+grep -q 'Frozen image digest mismatch; stopping before evaluation' "$TMP/digest-mismatch/stdout"
+if grep -q '^harness run' "$TMP/digest-mismatch/order"; then
+  printf 'Evaluation ran despite a frozen digest mismatch\n' >&2
+  exit 1
+fi
+grep -q '^docker --context smoke-test pull registry.invalid/demo@sha256:' "$TMP/digest-mismatch/order"
 printf 'FD2 gold smoke fake-docker tests PASS\n'

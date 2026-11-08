@@ -64,7 +64,7 @@ CODEX_ASSETS = {
 }
 OFFICIAL_CODEX_DIGESTS = MappingProxyType({name: value[1] for name, value in CODEX_ASSETS.items()})
 
-Grader = Callable[..., tuple[Mapping, Mapping | None]]
+Grader = Callable[..., tuple[Mapping, Mapping | None] | None]
 
 
 def _render_prompt(task: SweTask, repo: str, base: str) -> str:
@@ -363,8 +363,13 @@ class SweSolver(DockerSolver):
         output = out / "harness" / f"run-{run}"
         output.mkdir(parents=True, mode=0o700)
         try:
-            results, report = self.grader(task, prediction, output, run=run, image=self.grading_image,
-                                          container_name=scope + "-grade")
+            graded = self.grader(task, prediction, output, run=run, image=self.grading_image,
+                                 container_name=scope + "-grade")
+            if graded is None:
+                failure = getattr(self.grader, "failure", None)
+                raise _Stop(failure.get("reason", "harness_error") if isinstance(failure, Mapping)
+                            else "harness_error")
+            results, report = graded
         except (OSError, TypeError, ValueError, subprocess.SubprocessError) as error:
             raise _Stop("harness_error") from error
         grade = score_from_report(task.instance_id, results, report)

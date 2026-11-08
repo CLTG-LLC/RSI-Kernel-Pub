@@ -12,11 +12,12 @@ from .adapter import SweAdapter
 from .feedback import proposer_input
 from .grading import Grade, predictions, read_report, score_all, score_from_report, summary_counts
 from .splits import CUTOFF, CarvedSplits, carve
+from .remote import RemoteGrader
 from .solver import SweSolver
 from .tasks import ALLOWED_COLUMNS, LANGUAGES, SweStop, SweTask, load_tasks
 
 __all__ = [
-    "ALLOWED_COLUMNS", "CUTOFF", "CarvedSplits", "Grade", "LANGUAGES", "SweAdapter", "SweSolver", "SweStop", "SweTask",
+    "ALLOWED_COLUMNS", "CUTOFF", "CarvedSplits", "Grade", "RemoteGrader", "LANGUAGES", "SweAdapter", "SweSolver", "SweStop", "SweTask",
     "carve", "load_tasks", "predictions", "proposer_input", "read_report",
     "score_all", "score_from_report", "summary_counts",
 ]

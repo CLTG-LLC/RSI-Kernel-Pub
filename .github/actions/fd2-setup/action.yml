@@ -1,0 +1,40 @@
+{
+  "name": "FD2 frozen native evaluator setup",
+  "description": "Reuse legacy-store/disk setup and install the frozen harness under its hash lock.",
+  "runs": {
+    "using": "composite",
+    "steps": [
+      {
+        "name": "Move Docker storage to a separate larger volume when available",
+        "shell": "bash",
+        "run": "set -euo pipefail\ndf -h / /mnt\ndocker info -f 'StorageDriver={{.Driver}} DriverStatus={{json .DriverStatus}}'\n# Read the storage mode while the daemon runs; stop the socket too so no\n# client call re-activates dockerd with the old configuration.\ndriver_status=\"$(docker info -f '{{json .DriverStatus}}')\"\n# The containerd image store \"uses more disk space than the legacy storage\n# drivers\" for the same images (docs.docker.com/engine/storage/containerd/);\n# a 19.7 GB image grew to ~104 GB of image data there and STOPped low_disk\n# (#137). Switch to the legacy store first, via the documented\n# features.containerd-snapshotter=false, deep-merged so other features survive.\nif printf '%s' \"$driver_status\" | grep -q 'io.containerd.snapshotter'; then\n  sudo systemctl stop docker.socket docker\n  sudo mkdir -p /etc/docker\n  if sudo test -f /etc/docker/daemon.json; then\n    sudo jq '. * {\"features\":{\"containerd-snapshotter\":false}}' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null\n  else\n    printf '%s\\n' '{\"features\":{\"containerd-snapshotter\":false}}' | sudo tee /etc/docker/daemon.json.new >/dev/null\n  fi\n  sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json\n  sudo systemctl start docker.socket docker\n  driver_status=\"$(docker info -f '{{json .DriverStatus}}')\"\n  if printf '%s' \"$driver_status\" | grep -q 'io.containerd.snapshotter'; then\n    echo 'containerd snapshotter still in use after the switch' >&2; exit 1\n  fi\n  docker info -f 'StorageDriver={{.Driver}}'\n  echo 'Legacy image store now in use (containerd snapshotter disabled)'\nfi\ndriver_before=\"$(docker info -f '{{.Driver}}')\"\n# Relocate only where it is possible: /mnt is a separate filesystem. The\n# legacy store is in use from here on, so data-root moves its images.\n# Otherwise keep the layout and rely on the per-instance disk diagnostics\n# and the low-disk STOP in gold_smoke.sh. A dispatch observed / = 145G with\n# 88G free and /mnt on the same device, so the relocation is skipped there.\nif [ \"$(stat -c %d /mnt)\" = \"$(stat -c %d /)\" ]; then\n  echo 'Skipping relocation: /mnt is on the same filesystem as /'; exit 0\nfi\n# runner-images Ubuntu2404 README: Docker 28.0.4; Docker's containerd\n# storage docs make it the default only for fresh 29.0+ installations.\n# docs.docker.com/engine/storage/containerd/\n# docs.docker.com/engine/daemon/#daemon-data-directory\nsudo systemctl stop docker.socket docker\nsudo mkdir -p /etc/docker\n# docs.docker.com/engine/daemon/#daemon-data-directory\nif sudo test -f /etc/docker/daemon.json; then\n  sudo jq '. + {\"data-root\":\"/mnt/docker-data\"}' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null\nelse\n  printf '%s\\n' '{\"data-root\":\"/mnt/docker-data\"}' | sudo tee /etc/docker/daemon.json.new >/dev/null\nfi\nsudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json\nsudo systemctl start docker.socket docker\ntest \"$(docker info -f '{{.DockerRootDir}}')\" = /mnt/docker-data\ntest \"$(docker info -f '{{.Driver}}')\" = \"$driver_before\"\ndf -h / /mnt"
+      },
+      {
+        "name": "Free runner disk space",
+        "shell": "bash",
+        "run": "df -h /\nsudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL\ndf -h /"
+      },
+      {
+        "name": "Check out the pinned harness",
+        "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "with": {
+          "repository": "microsoft/SWE-bench-Live",
+          "ref": "091279261203b243386adf256b2b107656013dbf",
+          "path": "SWE-bench-Live",
+          "submodules": "recursive"
+        }
+      },
+      {
+        "uses": "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1",
+        "with": {
+          "python-version": "3.12"
+        }
+      },
+      {
+        "name": "Install hash-locked harness and dataset tools",
+        "shell": "bash",
+        "run": "python -m pip install --require-hashes -r tools/fd2/harness-requirements.lock\npython -m pip install --no-deps --no-build-isolation -e SWE-bench-Live ./SWE-bench-Live/launch/"
+      }
+    ]
+  }
+}

@@ -1,0 +1,40 @@
+# Harness 091279261203b243386adf256b2b107656013dbf; RepoLaunch c4b623d930f3728e5338664bb634021b98492cbf.
+# Dependencies from their pyproject.toml files; self-reference swebench is supplied by the pinned checkout.
+# Build requirements locked too: install local sources with --no-deps --no-build-isolation.
+beautifulsoup4
+chardet
+datasets
+docker
+ghapi
+GitPython
+modal
+pre-commit
+python-dotenv
+requests
+rich
+tenacity
+tqdm
+unidiff
+fastcore
+fire
+setuptools>=42
+beautifulsoup4>=4.13.4
+docker>=7.1.0
+fire>=0.7.0
+gitpython>=3.1.44
+langchain==0.3.26
+langchain-community==0.3.27
+langchain-core==0.3.68
+litellm
+langgraph==0.5.2
+pydantic==2.11.7
+requests>=2.32.4
+rich>=14.0.0
+tenacity>=9.1.2
+tornado>=6.5.1
+typing-extensions>=4.14.1
+pygithub
+setuptools>=61
+wheel
+huggingface-hub
+pyarrow

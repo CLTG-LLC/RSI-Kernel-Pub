@@ -5,6 +5,7 @@ Column projection: https://arrow.apache.org/docs/python/generated/pyarrow.parque
 """
 
 import argparse
+import hashlib
 import json
 import re
 from datetime import datetime
@@ -56,6 +57,9 @@ def load_tables():
         parts = []
         for name in files:
             path = hf_hub_download(DATASET, name, repo_type="dataset", revision=REVISION)
+            from prepare_frozen import EXPECTED_SHA256
+            if hashlib.sha256(Path(path).read_bytes()).hexdigest() != EXPECTED_SHA256.get(name):
+                raise RuntimeError(f"SHA-256 mismatch for {name}")
             parts.append(pq.ParquetFile(Path(path)).read(columns=list(COLUMNS)))
         tables[split] = pa.concat_tables(parts).to_pylist()
     return tables

@@ -8,100 +8,19 @@ permissions:
 
 jobs:
   gold-smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 360
     steps:
-      - name: Move Docker storage to a separate larger volume when available
-        run: |
-          set -euo pipefail
-          df -h / /mnt
-          docker info -f 'StorageDriver={{.Driver}} DriverStatus={{json .DriverStatus}}'
-          # Read the storage mode while the daemon runs; stop the socket too so no
-          # client call re-activates dockerd with the old configuration.
-          driver_status="$(docker info -f '{{json .DriverStatus}}')"
-          # The containerd image store "uses more disk space than the legacy storage
-          # drivers" for the same images (docs.docker.com/engine/storage/containerd/);
-          # a 19.7 GB image grew to ~104 GB of image data there and STOPped low_disk
-          # (#137). Switch to the legacy store first, via the documented
-          # features.containerd-snapshotter=false, deep-merged so other features survive.
-          if printf '%s' "$driver_status" | grep -q 'io.containerd.snapshotter'; then
-            sudo systemctl stop docker.socket docker
-            sudo mkdir -p /etc/docker
-            if sudo test -f /etc/docker/daemon.json; then
-              sudo jq '. * {"features":{"containerd-snapshotter":false}}' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
-            else
-              printf '%s\n' '{"features":{"containerd-snapshotter":false}}' | sudo tee /etc/docker/daemon.json.new >/dev/null
-            fi
-            sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
-            sudo systemctl start docker.socket docker
-            driver_status="$(docker info -f '{{json .DriverStatus}}')"
-            if printf '%s' "$driver_status" | grep -q 'io.containerd.snapshotter'; then
-              echo 'containerd snapshotter still in use after the switch' >&2; exit 1
-            fi
-            docker info -f 'StorageDriver={{.Driver}}'
-            echo 'Legacy image store now in use (containerd snapshotter disabled)'
-          fi
-          driver_before="$(docker info -f '{{.Driver}}')"
-          # Relocate only where it is possible: /mnt is a separate filesystem. The
-          # legacy store is in use from here on, so data-root moves its images.
-          # Otherwise keep the layout and rely on the per-instance disk diagnostics
-          # and the low-disk STOP in gold_smoke.sh. A dispatch observed / = 145G with
-          # 88G free and /mnt on the same device, so the relocation is skipped there.
-          if [ "$(stat -c %d /mnt)" = "$(stat -c %d /)" ]; then
-            echo 'Skipping relocation: /mnt is on the same filesystem as /'; exit 0
-          fi
-          # runner-images Ubuntu2404 README: Docker 28.0.4; Docker's containerd
-          # storage docs make it the default only for fresh 29.0+ installations.
-          # docs.docker.com/engine/storage/containerd/
-          # docs.docker.com/engine/daemon/#daemon-data-directory
-          sudo systemctl stop docker.socket docker
-          sudo mkdir -p /etc/docker
-          # docs.docker.com/engine/daemon/#daemon-data-directory
-          if sudo test -f /etc/docker/daemon.json; then
-            sudo jq '. + {"data-root":"/mnt/docker-data"}' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
-          else
-            printf '%s\n' '{"data-root":"/mnt/docker-data"}' | sudo tee /etc/docker/daemon.json.new >/dev/null
-          fi
-          sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
-          sudo systemctl start docker.socket docker
-          test "$(docker info -f '{{.DockerRootDir}}')" = /mnt/docker-data
-          test "$(docker info -f '{{.Driver}}')" = "$driver_before"
-          df -h / /mnt
-
-      # Standard runners have about 14 GB free; a first dispatch hit "No space left on device".
-      # Remove large preinstalled toolchains this job never uses, as the common
-      # free-disk-space actions do (e.g. github.com/jlumbroso/free-disk-space). Done inline,
-      # so no new third-party action; Docker images are untouched; no prune.
-      - name: Free runner disk space
-        run: |
-          df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          df -h /
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Check out the pinned harness
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          repository: microsoft/SWE-bench-Live
-          ref: 091279261203b243386adf256b2b107656013dbf
-          path: SWE-bench-Live
-          submodules: recursive
-      # Python 3.12 and pip install -e . ./launch/ are the harness README setup.
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: '3.12'
-      # Official uv action, same SHA pin as ci.yml: https://docs.astral.sh/uv/guides/integration/github/
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-      - name: Install harness dependencies
-        working-directory: SWE-bench-Live
-        run: python -m pip install -e . ./launch/
+      - uses: ./.github/actions/fd2-setup
       - name: Select and download the frozen dataset
         run: |
           mkdir -p smoke
-          uv run --with huggingface_hub --with pyarrow python tools/fd2/select_smoke.py --output smoke/selection.json
+          python tools/fd2/select_smoke.py --output smoke/selection.json
           hf download SWE-bench-Live/MultiLang --repo-type dataset \
             --revision eb09c2e5db6e4c5a95e01c903c8fd1d5da33c4f3 \
             --include 'data/*.parquet' --quiet > smoke/dataset-path.txt
-          uv run --with huggingface_hub --with pyarrow python tools/fd2/prepare_frozen.py \
+          python tools/fd2/prepare_frozen.py \
             --selection smoke/selection.json \
             --dataset-dir "$(cat smoke/dataset-path.txt)" \
             --output smoke/frozen.jsonl

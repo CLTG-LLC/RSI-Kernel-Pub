@@ -247,6 +247,11 @@ while IFS=$'\t' read -r instance_id split image; do
   fi
   if [ -z "$abort_instance" ]; then
     digest="$(docker ${DOCKER_CONTEXT_ARGS[@]+"${DOCKER_CONTEXT_ARGS[@]}"} image inspect "$image" --format '{{index .RepoDigests 0}}' | sed 's/^.*@//')"
+  if [[ "$image" == *@* ]] && [ "$digest" != "${image##*@}" ]; then
+    printf 'Frozen image digest mismatch; stopping before evaluation: %s\n' "$instance_id"
+    write_summary 1 'image_digest_mismatch'
+    exit $?
+  fi
   case "$digest" in sha256:*) ;; *) printf 'No repository digest: %s\n' "$instance_id"; write_summary 1; exit $? ;; esac
   pinned_image="$(python - "$DATASET_PATH_FILE" "$instance_id" "$digest" <<'PY'
 import json
@@ -279,6 +284,9 @@ PY
     [ "$state" -eq 1 ]
   }
   for run in 1 2 3; do
+    executed=false
+    started_at=
+    completed_at=
     if [ -n "$abort_instance" ]; then
       resolved=false
       command_status=137
@@ -293,6 +301,18 @@ PY
       fail_stop 'Disk measurement failed'
     fi
     started="$(date +%s)"
+    started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    executed=true
+    STARTED_AT="$started_at" PINNED_IMAGE="$pinned_image" python - "$OUTPUT_DIR/active-run.json" "$instance_id" "$split" "$run" <<'PYCODE'
+import json
+import sys
+with open(sys.argv[1], "w", encoding="utf-8") as stream:
+    json.dump({"started_at": __import__("os").environ["STARTED_AT"],
+               "image_digests": [__import__("os").environ["PINNED_IMAGE"]],
+               "instance_id": sys.argv[2], "split": sys.argv[3], "run": int(sys.argv[4]),
+               "executed": True}, stream)
+PYCODE
+    if [ "$?" -ne 0 ]; then fail_stop 'Attempt record write failed'; fi
     watch_job python -m evaluation.evaluation \
       --dataset "$DATASET_PATH_FILE" \
       --split "$split" \
@@ -305,6 +325,7 @@ PY
       > "$HARNESS_LOGS/${split}-run-${run}.log" 2>&1
     command_status=$?
     wall_seconds=$(( $(date +%s) - started ))
+    completed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     if [ -n "$WATCHDOG_MEASURE_FAILED" ]; then
       stop_measurement_failed "run-$run"
     fi
@@ -322,12 +343,13 @@ try:
     with open(sys.argv[1], encoding="utf-8") as stream:
         report = json.load(stream)
 except (OSError, ValueError):
-    print("false")
+    print("missing")
 else:
-    print("true" if report.get("resolved") is True else "false")
+    print("true" if report.get("resolved") is True else "false" if report.get("resolved") is False else "missing")
 PY
 )"
     reason=
+    if [ "$resolved" = missing ]; then reason=harness_report_missing; fi
     fi
     if [ -n "$abort_instance" ]; then
       resolved=false
@@ -335,11 +357,14 @@ PY
       reason=low_disk
     fi
     digests="[\"${pinned_image}\"]"
-    python - "$ROWS" "$instance_id" "$split" "$run" "$resolved" "$wall_seconds" \
+    STARTED_AT="$started_at" COMPLETED_AT="$completed_at" EXECUTED="$executed" python - "$ROWS" "$instance_id" "$split" "$run" "$resolved" "$wall_seconds" \
       "$command_status" "$before" "$after" "$digests" "$image_size" "$reason" <<'PY'
 import json
+import os
 import sys
 row = {
+    "executed": os.environ["EXECUTED"] == "true",
+    "started_at": os.environ["STARTED_AT"] or None, "completed_at": os.environ["COMPLETED_AT"] or None,
     "instance_id": sys.argv[2], "split": sys.argv[3], "run": int(sys.argv[4]),
     "resolved": sys.argv[5] == "true", "wall_seconds": int(sys.argv[6]),
     "command_status": int(sys.argv[7]),
@@ -356,6 +381,7 @@ PY
   if [ "$record_status" -ne 0 ]; then
     fail_stop 'Run record write failed'
   fi
+  rm -f "$OUTPUT_DIR/active-run.json" || fail_stop 'Attempt record cleanup failed'
   done
   if ! cleanup; then
     printf 'Exact instance cleanup failed; stopping: %s\n' "$instance_id"

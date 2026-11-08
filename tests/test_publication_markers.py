@@ -4,33 +4,11 @@ Internal lane ids, private notes, local paths and routing names must not reach
 a published tree. Every hit fails; there is no allowlist.
 """
 
-import re
 import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-# Built from fragments so this file never matches itself; no file is exempt.
-# Private host/repo names are deliberately not listed: naming them here would publish them.
-MARKERS = {
-    "lane decision id": r"\bR-\d{3,}\b",
-    "lane research id": r"\bR-[A-Z]\b",
-    "build memo": "BUILD" + "-MEMO",
-    "decision log": "DECISIONS" + "-RSI",
-    "local home path": "/" + "Users/",
-    "local temp path": "/private" + "/tmp",
-    "grant requirement ids": r"\bB1\s*[–-]\s*B13\b",
-    "local proxy": r"\b" + "o" + "cx" + r"\b",
-    "model gateway": "Smart" + "TiTu",
-    "lane workspace": "tg" + "-work",
-    "other product": "Trust" + " Gateway",
-    "other product repo": "TG" + "-Java",
-    "grant spec item": r"\b" + "SP" + r"EC B\d+\b",
-    "internal plan section": r"\b" + "PL" + r"AN §",
-    "internal review rule": "RULE" + "-1",
-}
-# Case-insensitive so env-style spellings (e.g. NAME_API_KEY) are caught too.
-# https://docs.python.org/3/library/re.html#re.IGNORECASE
-PATTERN = re.compile("|".join(f"(?:{p})" for p in MARKERS.values()), re.IGNORECASE)
+from rsi_kernel.publication import PATTERN
 
 
 def files():

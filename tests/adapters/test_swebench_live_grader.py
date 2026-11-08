@@ -87,3 +87,22 @@ def test_harness_grader_requires_daemon_endpoint(tmp_path):
             grader(task(), tmp_path / "p.json", tmp_path, run=0, image=image, container_name="x")
     finally:
         _DOCKER_ENV.reset(token)
+
+
+@pytest.mark.parametrize("reason", ["dispatch_failure", "queue_expiry", "cancellation", "timeout",
+                                    "missing_artifact", "binding_mismatch", "silent_termination"])
+def test_remote_none_is_preserved_as_solver_failure(tmp_path, monkeypatch, reason):
+    from test_swebench_live_solver import fixture as solver_fixture, CANDIDATE
+
+    # Reuse the established full fake-Docker solver fixture, without a real daemon.
+    _, solver, _, _ = solver_fixture.__wrapped__(tmp_path, monkeypatch)
+
+    class MissingGrade:
+        failure = {"reason": reason}
+
+        def __call__(self, *args, **kwargs):
+            return None
+
+    solver.grader = MissingGrade()
+    solved = solver(CANDIDATE, task().item_id, run=0)
+    assert solved["score"] is None and solved["failure"]["reason"] == reason

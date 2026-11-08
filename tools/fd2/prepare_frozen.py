@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 
 # SHA-256 values from the metadata receipt for the same pinned dataset revision.
@@ -38,15 +39,34 @@ def write_selected_jsonl(paths, expected_hashes, selection, output, read_rows):
                 rows.append(row)
     if len(rows) != len(selection) or {row["instance_id"] for row in rows} != wanted:
         raise ValueError("Selected rows do not exactly match the frozen selection")
+    selected = {item["instance_id"]: item for item in selection}
+    prepared = []
+    for row in rows:
+        item = selected[row["instance_id"]]
+        image = item.get("docker_image", "")
+        if "@" in image:
+            if (not re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", image)
+                    or image_repository(row["docker_image"]) != image_repository(image)
+                    or row["docker_image"] != item.get("source_image", row["docker_image"])
+                    or ("@" in row["docker_image"] and row["docker_image"] != image)):
+                raise ValueError("frozen image repository or digest mismatch")
+            row = {**row, "docker_image": image}
+        prepared.append(row)
+    rows = prepared
     with output.open("x", encoding="utf-8") as stream:
         for row in rows:
             stream.write(json.dumps(row) + "\n")
     return output
 
 
+def image_repository(image):
+    reference = image.split("@", 1)[0]
+    return reference.rsplit(":", 1)[0] if ":" in reference.rsplit("/", 1)[-1] else reference
+
+
 def pin_image(path, instance_id, digest):
     """Replace one row's image reference with its already-pulled digest."""
-    if not digest.startswith("sha256:") or len(digest) != 71:
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
         raise ValueError("Expected a full sha256 image digest")
     with path.open(encoding="utf-8") as stream:
         rows = [json.loads(line) for line in stream if line.strip()]
@@ -54,7 +74,9 @@ def pin_image(path, instance_id, digest):
     if len(matches) != 1:
         raise ValueError("Expected exactly one matching selected row")
     image = matches[0]["docker_image"]
-    repository = image.split("@", 1)[0].rsplit(":", 1)[0]
+    if "@" in image and image.split("@", 1)[1] != digest:
+        raise ValueError("frozen image digest mismatch")
+    repository = image_repository(image)
     updated = [{**row, "docker_image": f"{repository}@{digest}"}
                if row["instance_id"] == instance_id else row for row in rows]
     with path.open("w", encoding="utf-8") as stream:
@@ -79,7 +101,7 @@ def main():
     import pyarrow.parquet as pq
     write_selected_jsonl(paths, EXPECTED_SHA256, selection, args.output,
                          lambda path: pq.read_table(path).to_pylist())
-    print("Verified 8 frozen Parquet hashes and wrote 8 selected rows; contents suppressed.")
+    print(f"Verified {len(EXPECTED_SHA256)} frozen Parquet hashes and wrote {len(selection)} selected rows; contents suppressed.")
 
 
 if __name__ == "__main__":
