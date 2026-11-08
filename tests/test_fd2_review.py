@@ -140,6 +140,28 @@ def test_aggregation_preserves_receipts_groups_builds_and_authoritative_timestam
     assert result["job_timestamps"] == jobs
 
 
+def test_aggregation_groups_same_image_despite_per_machine_metadata(tmp_path, monkeypatch):
+    tool = module(monkeypatch, "gold_validity")
+    item_ids = ["go/demo-1", "go/demo-2"]
+    sidecar = {"splits": {"dev": {"item_ids": item_ids, "repos": ["owner/image"]}}}
+    build = {"ImageOS": "ubuntu26", "ImageVersion": "build-1"}
+    receipts = []
+    for item_id in item_ids:
+        path = tmp_path / f"fd2-gold-validity-{item_id.split('/', 1)[1]}"
+        path.mkdir()
+        (path / "summary.json").write_text(json.dumps(tool.summarize(item_id, [
+            {"run": n, "command_status": 0, "resolved": True} for n in (1, 2, 3)])))
+        receipt = {"item_id": item_id, "runner_image_build": {**build, "Worker ID": item_id},
+                   "workflow_commit": "a" * 40, "run_id": "42", "evaluator_identity": {"frozen": True}}
+        (path / "runner.json").write_text(json.dumps(receipt))
+        receipts.append(receipt)
+    result = tool.aggregate(sidecar, tmp_path)
+    assert len(result["by_runner_build"]) == 1
+    assert result["by_runner_build"][0]["item_ids"] == item_ids
+    assert result["by_runner_build"][0]["runner_image_build"] == build
+    assert [row["receipt"] for row in result["instances"]] == receipts
+
+
 @pytest.mark.parametrize("field", ["displayTitle", "headSha"])
 def test_dispatch_response_run_is_validated_without_a_run_search(tmp_path, monkeypatch, field):
     from test_fd2_remote import make_grader

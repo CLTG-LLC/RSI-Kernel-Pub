@@ -55,8 +55,9 @@ def aggregate(sidecar, directory, *, jobs=None):
             for key, env in (("workflow_commit", "GITHUB_SHA"), ("run_id", "GITHUB_RUN_ID")):
                 if os.environ.get(env) and str(receipt[key]) != os.environ[env]:
                     raise ValueError("receipt workflow/run mismatch")
-            build_key = json.dumps(receipt["runner_image_build"], sort_keys=True)
-            group = groups.setdefault(build_key, {"runner_image_build": receipt["runner_image_build"],
+            build = {key: receipt["runner_image_build"].get(key) for key in ("ImageOS", "ImageVersion")}
+            build_key = json.dumps(build, sort_keys=True)
+            group = groups.setdefault(build_key, {"runner_image_build": build,
                                                    "item_ids": [], "outcomes": []})
             group["item_ids"].append(item["item_id"])
             group["outcomes"].append({"item_id": item["item_id"], "valid": summary["valid"],
