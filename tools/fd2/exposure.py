@@ -6,7 +6,17 @@ from pathlib import Path
 
 # Explicit lead-recorded historical bindings, not inferred from an empty directory.
 EMPTY_GOLD_TARGETS = {f"fd2-gold-smoke-{number}" for number in (1, 2, 3, 4, 6)}
-SOLVE_BINDINGS = {"fd2-smoke/evidence/swe-4117ba39": "rust/yvgude__lean-ctx-632"}
+SOLVE_BINDINGS = {
+    "fd2-smoke/evidence/swe-4117ba39": ("rust/yvgude__lean-ctx-632", 0),
+    "fd2-noise-floor/evidence/swe-40a78b3e": ("c/DeusData__codebase-memory-mcp-632", 0),
+    "fd2-noise-floor/evidence/swe-7a46233d": ("c/DeusData__codebase-memory-mcp-632", 1),
+    "fd2-noise-floor/evidence/swe-1f739d15": ("c/DeusData__codebase-memory-mcp-632", 2),
+    "fd2-noise-floor/evidence/swe-585f9e35": ("c/colbymchenry__codegraph-1051", 0),
+}
+# This one lead-verified STOP completed a model solve but never obtained a grade.
+FAILED_SOLVE_BINDING = "fd2-noise-floor/evidence/swe-7a46233d"
+# RemoteGrader writes this nested transport record; it is not another model attempt.
+GRADE_FAILURE_RECORD = f"{FAILED_SOLVE_BINDING}/harness/run-1/failure.json"
 SOLVE_FILES = {"attempt.json", "model_patch.diff", "measurement.json", "result.json"}
 # Solver __call__ writes container-scope.txt and attempt.json before staging/model use.
 ATTEMPT_MARKERS = SOLVE_FILES - {"result.json"} | {"container-scope.txt", "attempt-timing.json", "failure.json"}
@@ -47,6 +57,8 @@ def classify(root, files):
         return "preflight records (4 dry-run, 1 run launcher); solve counted at fd2-smoke, not again here"
     if name == "fd2-smoke" and any(path.name == "model_patch.diff" for path in files):
         return "solver smoke; root result.json is not a second solve"
+    if name == "fd2-noise-floor":
+        return "voided partial noise floor, operational STOP"
     raise ValueError(f"unclassified or missing record: {name}")
 
 
@@ -62,18 +74,23 @@ def reconcile(runs_root):
                 raise ValueError(f"symlink run directory: {root.name}")
             files = inventory(root)
             lines.append(f"rsi-runs/{root.name}: {classify(root, files)}")
-            parents = {path.parent for path in files if path.name in ATTEMPT_MARKERS}
+            parents = {path.parent for path in files if path.name in ATTEMPT_MARKERS
+                       and f"{root.name}/{path.as_posix()}" != GRADE_FAILURE_RECORD}
             parents |= {path.parent for path in files if path.name == "result.json" and "evidence" in path.parts}
             for parent in sorted(parents):
                 binding = f"{root.name}/{parent.as_posix()}"
-                if not all(parent / name in files for name in SOLVE_FILES):
+                required = SOLVE_FILES
+                if binding == FAILED_SOLVE_BINDING:
+                    required = SOLVE_FILES - {"result.json"} | {"failure.json"}
+                if not all(parent / name in files for name in required):
                     stops.append(f"incomplete solve record: {binding}")
                     continue
                 if binding not in SOLVE_BINDINGS:
                     stops.append(f"solve record has no content-free instance binding: {binding}")
                     continue
                 complete_bindings.add(binding)
-                counts[SOLVE_BINDINGS[binding]] += 1
+                item, run = SOLVE_BINDINGS[binding]
+                counts[item] += 1
         except (OSError, ValueError) as error:
             stops.append(str(error))
     for binding in sorted(set(SOLVE_BINDINGS) - complete_bindings):

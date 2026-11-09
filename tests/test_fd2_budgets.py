@@ -32,12 +32,86 @@ def test_join_rejects_missing_duplicate_and_unclassified_incomplete():
             join(sidecar, {"instances": rows})
 
 
+def registered_solves(root):
+    bindings = {
+        "fd2-smoke/evidence/swe-4117ba39": ("rust/yvgude__lean-ctx-632", 0),
+        "fd2-noise-floor/evidence/swe-40a78b3e": ("c/DeusData__codebase-memory-mcp-632", 0),
+        "fd2-noise-floor/evidence/swe-7a46233d": ("c/DeusData__codebase-memory-mcp-632", 1),
+        "fd2-noise-floor/evidence/swe-1f739d15": ("c/DeusData__codebase-memory-mcp-632", 2),
+        "fd2-noise-floor/evidence/swe-585f9e35": ("c/colbymchenry__codegraph-1051", 0),
+    }
+    for binding in bindings:
+        evidence = root / binding
+        evidence.mkdir(parents=True)
+        terminal = "failure.json" if binding.endswith("swe-7a46233d") else "result.json"
+        for name in ("attempt.json", "model_patch.diff", "measurement.json", terminal):
+            (evidence / name).touch()
+    transport = root / "fd2-noise-floor/evidence/swe-7a46233d/harness/run-1"
+    transport.mkdir(parents=True)
+    (transport / "failure.json").touch()
+    return bindings
+
+
+def test_voided_noise_floor_counts_all_solves_without_reading_content(tmp_path, monkeypatch):
+    exposure = tool("exposure")
+    bindings = registered_solves(tmp_path)
+    assert exposure.SOLVE_BINDINGS == bindings
+    for name in ("fd2-noise-launch.log", "fd2-smoke-launch.log"):
+        (tmp_path / name).touch()
+    monkeypatch.setattr(Path, "read_text", lambda *a, **k: pytest.fail("content read"))
+    monkeypatch.setattr(Path, "read_bytes", lambda *a, **k: pytest.fail("content read"))
+    report, stops = exposure.reconcile(tmp_path)
+    assert not stops
+    assert "voided partial noise floor, operational STOP" in report
+    assert "c/DeusData__codebase-memory-mcp-632: 3" in report
+    assert "c/colbymchenry__codegraph-1051: 1" in report
+    assert "rust/yvgude__lean-ctx-632: 1" in report
+    assert "total_model_solves=5" in report
+
+
+@pytest.mark.parametrize("name", ["swe-40a78b3e", "swe-7a46233d", "swe-1f739d15", "swe-585f9e35"])
+def test_missing_voided_solve_stops(tmp_path, name):
+    import shutil
+
+    registered_solves(tmp_path)
+    binding = f"fd2-noise-floor/evidence/{name}"
+    shutil.rmtree(tmp_path / binding)
+    assert f"registered solve binding missing or incomplete: {binding}" in tool("exposure").reconcile(tmp_path)[1]
+
+
+@pytest.mark.parametrize("name", ["attempt.json", "model_patch.diff", "measurement.json", "failure.json"])
+def test_incomplete_registered_stopped_solve_stops(tmp_path, name):
+    registered_solves(tmp_path)
+    binding = "fd2-noise-floor/evidence/swe-7a46233d"
+    (tmp_path / binding / name).unlink()
+    assert f"incomplete solve record: {binding}" in tool("exposure").reconcile(tmp_path)[1]
+
+
+def test_unbound_second_noise_floor_stops(tmp_path):
+    registered_solves(tmp_path)
+    (tmp_path / "fd2-noise-floor-2").mkdir()
+    assert "unclassified or missing record: fd2-noise-floor-2" in tool("exposure").reconcile(tmp_path)[1]
+
+
+def test_nested_grade_failure_exception_does_not_hide_solve_markers(tmp_path):
+    registered_solves(tmp_path)
+    nested = tmp_path / "fd2-noise-floor/evidence/swe-7a46233d/harness/run-1"
+    (nested / "attempt.json").touch()
+    assert any("harness/run-1" in stop for stop in tool("exposure").reconcile(tmp_path)[1])
+
+
+def test_failure_marker_does_not_replace_other_results(tmp_path):
+    registered_solves(tmp_path)
+    evidence = tmp_path / "fd2-noise-floor/evidence/swe-40a78b3e"
+    (evidence / "result.json").unlink()
+    (evidence / "failure.json").touch()
+    assert any("incomplete solve record" in stop for stop in tool("exposure").reconcile(tmp_path)[1])
+
+
 def test_exposure_reads_no_content_and_fails_closed(tmp_path, monkeypatch):
     exposure = tool("exposure")
+    registered_solves(tmp_path)
     evidence = tmp_path / "fd2-smoke/evidence/swe-4117ba39"
-    evidence.mkdir(parents=True)
-    for name in exposure.SOLVE_FILES:
-        (evidence / name).touch()
     monkeypatch.setattr(Path, "read_text", lambda *a, **k: pytest.fail("content read"))
     report, stops = exposure.reconcile(tmp_path)
     assert "rust/yvgude__lean-ctx-632: 1" in report
@@ -51,10 +125,8 @@ def test_exposure_reads_no_content_and_fails_closed(tmp_path, monkeypatch):
 
 def test_empty_gold_targets_require_explicit_disposition(tmp_path):
     exposure = tool("exposure")
+    registered_solves(tmp_path)
     evidence = tmp_path / "fd2-smoke/evidence/swe-4117ba39"
-    evidence.mkdir(parents=True)
-    for name in exposure.SOLVE_FILES:
-        (evidence / name).touch()
     (tmp_path / "fd2-gold-smoke-1").mkdir()
     report, stops = exposure.reconcile(tmp_path)
     assert "lead-recorded" in report
@@ -68,10 +140,8 @@ def test_empty_gold_targets_require_explicit_disposition(tmp_path):
                                        ("attempt.json", "attempt-timing.json", "failure.json")])
 def test_failed_attempt_without_patch_or_measurement_stops(tmp_path, markers):
     exposure = tool("exposure")
+    registered_solves(tmp_path)
     smoke = tmp_path / "fd2-smoke/evidence/swe-4117ba39"
-    smoke.mkdir(parents=True)
-    for name in exposure.SOLVE_FILES:
-        (smoke / name).touch()
     failed = smoke.parent / "failed-attempt"
     failed.mkdir()
     for name in markers:
